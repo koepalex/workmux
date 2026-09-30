@@ -20,7 +20,8 @@ use crate::config::{Config, SidebarPosition};
 use crate::git::GitStatus;
 use crate::github::{CheckSummary, PrSummary};
 use crate::multiplexer::{
-    LivePaneInfo, Multiplexer, TmuxBackend, create_backend, detect_backend, zellij::ZellijBackend,
+    AgentPane, LivePaneInfo, Multiplexer, TmuxBackend, create_backend, detect_backend,
+    zellij::ZellijBackend,
 };
 use crate::state::StateStore;
 
@@ -107,6 +108,43 @@ fn query_mux_state(mux: &dyn Multiplexer, instance_id: &str) -> Result<MuxState>
         "tmux" => query_tmux_state(&TmuxBackend::for_socket(instance_id)),
         "zellij" => query_zellij_state(&ZellijBackend::for_session(instance_id), instance_id),
         name => anyhow::bail!("sidebar is not supported by the {name} backend"),
+    }
+}
+
+fn include_unregistered_zellij_agents(
+    agents: &mut Vec<AgentPane>,
+    live_panes: &HashMap<String, LivePaneInfo>,
+) {
+    let mut known_panes: HashSet<String> =
+        agents.iter().map(|agent| agent.pane_id.clone()).collect();
+    for (pane_id, live) in live_panes {
+        if known_panes.contains(pane_id.as_str()) {
+            continue;
+        }
+        let Some(command) = live.current_command.as_deref() else {
+            continue;
+        };
+        let Some(agent_kind) = crate::agent_identity::classify_agent_kind(Some(command), None)
+        else {
+            continue;
+        };
+        known_panes.insert(pane_id.clone());
+        agents.push(AgentPane {
+            session: live.session.clone().unwrap_or_default(),
+            window_name: live.window.clone().unwrap_or_default(),
+            pane_id: pane_id.clone(),
+            window_id: live.window_id.clone().unwrap_or_default(),
+            window_index: live.window_index,
+            path: live.working_dir.clone(),
+            pane_title: live.title.clone(),
+            status: None,
+            status_ts: None,
+            activity_ts: None,
+            updated_ts: None,
+            window_cmd: None,
+            agent_command: Some(command.to_string()),
+            agent_kind: Some(agent_kind),
+        });
     }
 }
 
@@ -2248,6 +2286,13 @@ pub fn run() -> Result<()> {
                         tmux_state.server_boot_id.as_deref(),
                     ) {
                         Ok((agents, stats)) => {
+                            let mut agents = agents;
+                            if backend_name == "zellij" {
+                                include_unregistered_zellij_agents(
+                                    &mut agents,
+                                    &tmux_state.live_panes,
+                                );
+                            }
                             tracing::trace!(
                                 listed = stats.listed,
                                 metadata = stats.metadata,
@@ -4694,5 +4739,73 @@ mod tests {
             assert_eq!(agent.activity_ts, Some(1012));
             assert!(!output.snapshot.interrupted_pane_ids.contains("%1"));
         }
+    }
+
+    #[test]
+    fn idle_zellij_agent_is_visible_before_status_hook_registration() {
+        let mut agents = Vec::new();
+        let live_panes = HashMap::from([(
+            "terminal_1".to_string(),
+            LivePaneInfo {
+                pid: None,
+                current_command: Some("copilot --resume".to_string()),
+                working_dir: PathBuf::from("/repo/worktree"),
+                title: Some("Feature work - GitHub Copilot".to_string()),
+                session: Some("zellij-session".to_string()),
+                window: Some("feature".to_string()),
+                session_id: None,
+                window_id: Some("7".to_string()),
+                window_index: Some(1),
+            },
+        )]);
+
+        include_unregistered_zellij_agents(&mut agents, &live_panes);
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].pane_id, "terminal_1");
+        assert_eq!(agents[0].agent_kind.as_deref(), Some("copilot"));
+        assert_eq!(agents[0].status, None);
+    }
+
+    #[test]
+    fn registered_zellij_agent_is_not_duplicated() {
+        let live = LivePaneInfo {
+            pid: None,
+            current_command: Some("copilot --resume".to_string()),
+            working_dir: PathBuf::from("/repo/worktree"),
+            title: Some("Feature work - GitHub Copilot".to_string()),
+            session: Some("zellij-session".to_string()),
+            window: Some("feature".to_string()),
+            session_id: None,
+            window_id: Some("7".to_string()),
+            window_index: Some(1),
+        };
+        let mut agents = vec![AgentPane {
+            session: "zellij-session".to_string(),
+            window_name: "feature".to_string(),
+            pane_id: "terminal_1".to_string(),
+            window_id: "7".to_string(),
+            window_index: Some(1),
+            path: PathBuf::from("/repo/worktree"),
+            pane_title: live.title.clone(),
+            status: Some(crate::multiplexer::AgentStatus::Working),
+            status_ts: Some(1),
+            activity_ts: Some(1),
+            updated_ts: Some(1),
+            window_cmd: None,
+            agent_command: Some("copilot".to_string()),
+            agent_kind: Some("copilot".to_string()),
+        }];
+
+        include_unregistered_zellij_agents(
+            &mut agents,
+            &HashMap::from([("terminal_1".to_string(), live)]),
+        );
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(
+            agents[0].status,
+            Some(crate::multiplexer::AgentStatus::Working)
+        );
     }
 }

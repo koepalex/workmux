@@ -230,6 +230,32 @@ fn active_dumped_tab(layout: &KdlNode, tab_position: u32) -> Option<KdlNode> {
         .map(|tab| (*tab).clone())
 }
 
+fn remove_existing_sidebar(node: &mut KdlNode) {
+    let is_pane = node.name().value() == "pane";
+    let Some(children) = node.children_mut() else {
+        return;
+    };
+    let mut removed_directly = false;
+    let mut retained = Vec::new();
+    for mut child in std::mem::take(children.nodes_mut()) {
+        if child.get("name").and_then(KdlValue::as_string) == Some(SIDEBAR_PANE_NAME) {
+            removed_directly = true;
+        } else {
+            remove_existing_sidebar(&mut child);
+            retained.push(child);
+        }
+    }
+    *children.nodes_mut() = retained;
+    let replacement = (removed_directly
+        && is_pane
+        && children.nodes().len() == 1
+        && children.nodes()[0].name().value() == "pane")
+        .then(|| children.nodes()[0].clone());
+    if let Some(replacement) = replacement {
+        *node = replacement;
+    }
+}
+
 fn prepare_retained_content(node: &mut KdlNode) {
     if node.name().value() != "pane" || is_zellij_ui_pane(node) {
         return;
@@ -287,6 +313,7 @@ fn layout_with_sidebar(
         .ok_or_else(|| anyhow!("dumped Zellij layout has no layout node"))?;
     let mut tab = active_dumped_tab(layout, tab_position)
         .ok_or_else(|| anyhow!("dumped Zellij layout has no target tab"))?;
+    remove_existing_sidebar(&mut tab);
     let original_direction = tab.get("split_direction").cloned();
     let original_children = tab
         .children_mut()
@@ -343,20 +370,6 @@ fn layout_with_sidebar(
     output.autoformat_no_comments();
     output.ensure_v1();
     Ok(output.to_string())
-}
-
-fn wait_for_pane_to_close(instance_id: &str, pane_id: &str) -> Result<()> {
-    for _ in 0..10 {
-        if backend(instance_id)
-            .sidebar_tabs()?
-            .iter()
-            .all(|tab| tab.panes.iter().all(|pane| pane.pane_id != pane_id))
-        {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    bail!("Zellij sidebar pane {pane_id} did not close")
 }
 
 fn close_generated_terminal_placeholders(
@@ -452,12 +465,8 @@ fn create_sidebar_in_tab(
     replace_existing: bool,
 ) -> Result<()> {
     let mux = backend(instance_id);
-    if let Some(sidebar) = tab.panes.iter().find(|pane| is_sidebar_pane(&pane.title)) {
-        if !replace_existing {
-            return Ok(());
-        }
-        mux.close_pane_by_id(&sidebar.pane_id)?;
-        wait_for_pane_to_close(instance_id, &sidebar.pane_id)?;
+    if tab.panes.iter().any(|pane| is_sidebar_pane(&pane.title)) && !replace_existing {
+        return Ok(());
     }
     let Some(target) = tab
         .panes
@@ -696,6 +705,90 @@ mod tests {
         assert_eq!(move_direction(bottom_right, left), Some("left"));
         assert_eq!(move_direction(bottom_right, top_right), Some("up"));
         assert_eq!(move_direction(left, left), None);
+    }
+
+    #[test]
+    fn replacing_sidebar_preserves_existing_content_ratio() {
+        let dumped = r#"
+            layout {
+                tab name="one" focus=true {
+                    pane size=1 borderless=true {
+                        plugin location="zellij:tab-bar"
+                    }
+                    pane split_direction="vertical" {
+                        pane command="/tmp/workmux" name="workmux-sidebar" size=31 {
+                            args "_sidebar-run"
+                            start_suspended true
+                        }
+                        pane command="copilot" size="25%" {
+                            args "--resume"
+                            start_suspended true
+                        }
+                        pane command="/bin/zsh" size="75%" {
+                            args "-l"
+                            start_suspended true
+                        }
+                    }
+                    pane size=1 borderless=true {
+                        plugin location="zellij:status-bar"
+                    }
+                }
+            }
+        "#;
+
+        let first_output = layout_with_sidebar(
+            dumped,
+            0,
+            SidebarPosition::Left,
+            KdlValue::Integer(30),
+            "/tmp/workmux",
+            "/tmp",
+        )
+        .unwrap();
+        let output = layout_with_sidebar(
+            &first_output,
+            0,
+            SidebarPosition::Left,
+            KdlValue::Integer(30),
+            "/tmp/workmux",
+            "/tmp",
+        )
+        .unwrap();
+        let document = KdlDocument::parse_v1(&output).unwrap();
+        let tab = document
+            .get("layout")
+            .and_then(KdlNode::children)
+            .and_then(|children| children.get("tab"))
+            .unwrap();
+        let wrapper = &tab.children().unwrap().nodes()[1];
+        let panes = wrapper.children().unwrap().nodes();
+        assert_eq!(
+            panes
+                .iter()
+                .filter(|pane| {
+                    pane.get("name").and_then(KdlValue::as_string) == Some(SIDEBAR_PANE_NAME)
+                })
+                .count(),
+            1,
+            "{output}"
+        );
+        let content_panes = panes[1].children().unwrap().nodes();
+        assert_eq!(
+            content_panes[0].get("size"),
+            Some(&KdlValue::String("25%".into())),
+            "{output}"
+        );
+        assert_eq!(
+            content_panes[1].get("size"),
+            Some(&KdlValue::String("75%".into())),
+            "{output}"
+        );
+        let root_panes = tab.children().unwrap().nodes();
+        assert_eq!(root_panes.len(), 3, "{output}");
+        assert!(is_zellij_ui_pane(&root_panes[0]), "{output}");
+        assert!(is_zellij_ui_pane(&root_panes[2]), "{output}");
+        assert_eq!(root_panes[2].get("size"), Some(&KdlValue::Integer(1)));
+        assert_eq!(root_panes[2].get("borderless"), Some(&KdlValue::Bool(true)));
     }
 
     #[test]
