@@ -46,6 +46,16 @@ struct PaneInfo {
     #[serde(default)]
     tab_name: String,
     #[serde(default)]
+    tab_position: Option<u32>,
+    #[serde(default)]
+    pane_x: Option<u16>,
+    #[serde(default)]
+    pane_y: Option<u16>,
+    #[serde(default)]
+    pane_columns: Option<u16>,
+    #[serde(default)]
+    pane_rows: Option<u16>,
+    #[serde(default)]
     title: String,
 }
 
@@ -58,6 +68,34 @@ struct TabInfo {
     name: String,
     #[allow(dead_code)]
     active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ZellijSidebarPane {
+    pub pane_id: String,
+    pub title: String,
+    pub is_focused: bool,
+    pub pane_x: Option<u16>,
+    pub pane_y: Option<u16>,
+    pub pane_columns: Option<u16>,
+    pub pane_rows: Option<u16>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ZellijSidebarTab {
+    pub tab_id: u32,
+    pub active: bool,
+    pub panes: Vec<ZellijSidebarPane>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ZellijSidebarSnapshot {
+    pub live_panes: std::collections::HashMap<String, LivePaneInfo>,
+    pub active_windows: std::collections::HashSet<(String, String)>,
+    pub pane_window_ids: std::collections::HashMap<String, String>,
+    pub pane_window_indexes: std::collections::HashMap<String, u32>,
+    pub active_pane_ids: std::collections::HashSet<String>,
+    pub window_pane_counts: std::collections::HashMap<String, usize>,
 }
 
 impl TabInfo {
@@ -437,9 +475,90 @@ impl ZellijBackend {
             session: self.session_name(),
             window: Some(canonical_tab_name(&pane.tab_name).to_string()).filter(|t| !t.is_empty()),
             session_id: None,
-            window_id: None,
-            window_index: None,
+            window_id: pane.tab_id.map(|id| id.to_string()),
+            window_index: pane.tab_position,
         }
+    }
+
+    pub(crate) fn sidebar_tabs(&self) -> Result<Vec<ZellijSidebarTab>> {
+        let panes = self.list_panes()?;
+        let tabs = self.list_tabs()?;
+        Ok(tabs
+            .into_iter()
+            .map(|tab| ZellijSidebarTab {
+                tab_id: tab.tab_id,
+                active: tab.active,
+                panes: panes
+                    .iter()
+                    .filter(|pane| !pane.is_plugin && pane.tab_id == Some(tab.tab_id))
+                    .map(|pane| ZellijSidebarPane {
+                        pane_id: format!("terminal_{}", pane.id),
+                        title: pane.title.clone(),
+                        is_focused: pane.is_focused,
+                        pane_x: pane.pane_x,
+                        pane_y: pane.pane_y,
+                        pane_columns: pane.pane_columns,
+                        pane_rows: pane.pane_rows,
+                    })
+                    .collect(),
+            })
+            .collect())
+    }
+
+    pub(crate) fn sidebar_snapshot(&self) -> Result<ZellijSidebarSnapshot> {
+        let session = self.session_name().unwrap_or_else(|| "default".to_string());
+        let panes = self.list_panes()?;
+        let tabs = self.list_tabs()?;
+        let mut snapshot = ZellijSidebarSnapshot {
+            live_panes: std::collections::HashMap::new(),
+            active_windows: std::collections::HashSet::new(),
+            pane_window_ids: std::collections::HashMap::new(),
+            pane_window_indexes: std::collections::HashMap::new(),
+            active_pane_ids: std::collections::HashSet::new(),
+            window_pane_counts: std::collections::HashMap::new(),
+        };
+
+        for tab in tabs {
+            let window_id = tab.tab_id.to_string();
+            if tab.active {
+                snapshot
+                    .active_windows
+                    .insert((session.clone(), window_id.clone()));
+            }
+            let tab_panes: Vec<_> = panes
+                .iter()
+                .filter(|pane| !pane.is_plugin && pane.tab_id == Some(tab.tab_id))
+                .collect();
+            snapshot
+                .window_pane_counts
+                .insert(window_id.clone(), tab_panes.len());
+
+            for pane in tab_panes {
+                let pane_id = format!("terminal_{}", pane.id);
+                snapshot
+                    .pane_window_ids
+                    .insert(pane_id.clone(), window_id.clone());
+                snapshot
+                    .pane_window_indexes
+                    .insert(pane_id.clone(), pane.tab_position.unwrap_or(tab.position));
+                if pane.is_focused {
+                    snapshot.active_pane_ids.insert(pane_id.clone());
+                }
+                snapshot
+                    .live_panes
+                    .insert(pane_id, self.build_live_pane_info(pane));
+            }
+        }
+
+        Ok(snapshot)
+    }
+
+    pub(crate) fn close_pane_by_id(&self, pane_id: &str) -> Result<()> {
+        self.command()
+            .args(&["action", "close-pane", "--pane-id", pane_id])
+            .run()
+            .with_context(|| format!("Failed to close zellij pane '{}'", pane_id))
+            .map(|_| ())
     }
 
     fn focus_pane_by_id(&self, pane_id: &str) -> Result<()> {
@@ -1191,6 +1310,11 @@ mod tests {
             pane_cwd: None,
             tab_id,
             tab_name: String::new(),
+            tab_position: None,
+            pane_x: None,
+            pane_y: None,
+            pane_columns: None,
+            pane_rows: None,
             title: String::new(),
         }
     }
@@ -1227,6 +1351,21 @@ mod tests {
         assert_eq!(backend.instance_id(), "dev session");
         assert_eq!(backend.shell_command(), "zellij --session 'dev session'");
         assert!(backend.is_inside_session());
+    }
+
+    #[test]
+    fn live_pane_info_uses_stable_tab_identity() {
+        let backend = ZellijBackend::for_session("dev");
+        let mut pane = test_pane(7, false, Some(42));
+        pane.tab_position = Some(3);
+        pane.tab_name = "feature".to_string();
+
+        let info = backend.build_live_pane_info(&pane);
+
+        assert_eq!(info.session.as_deref(), Some("dev"));
+        assert_eq!(info.window.as_deref(), Some("feature"));
+        assert_eq!(info.window_id.as_deref(), Some("42"));
+        assert_eq!(info.window_index, Some(3));
     }
 
     // === normalize_terminal_pane_id ===

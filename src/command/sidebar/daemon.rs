@@ -1,4 +1,4 @@
-//! Sidebar daemon: single process that polls tmux and pushes snapshots to clients.
+//! Sidebar daemon: polls multiplexer state and pushes snapshots to clients.
 
 use anyhow::Result;
 use ignore::gitignore::Gitignore;
@@ -19,7 +19,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::config::{Config, SidebarPosition};
 use crate::git::GitStatus;
 use crate::github::{CheckSummary, PrSummary};
-use crate::multiplexer::{LivePaneInfo, Multiplexer, TmuxBackend, create_backend, detect_backend};
+use crate::multiplexer::{
+    LivePaneInfo, Multiplexer, TmuxBackend, create_backend, detect_backend, zellij::ZellijBackend,
+};
 use crate::state::StateStore;
 
 use super::app::{SidebarFilterMode, SidebarLayoutMode};
@@ -27,19 +29,12 @@ use super::snapshot::{CheckPathEntry, PrPathEntry, SnapshotInputs, build_snapsho
 
 /// Compute the socket path for a multiplexer instance.
 pub fn socket_path(instance_id: &str) -> PathBuf {
-    // FNV-1a provides a stable fixed-width key across the controller and daemon
-    // while keeping long tmux socket paths below Unix socket limits.
-    let mut key = 0xcbf29ce484222325u64;
-    for byte in instance_id.as_bytes() {
-        key ^= u64::from(*byte);
-        key = key.wrapping_mul(0x100000001b3);
-    }
-    std::env::temp_dir().join(format!("workmux-sidebar-{key:016x}.sock"))
+    super::session_state::socket_path(instance_id)
 }
 
-/// Result of a batched tmux query.
+/// Result of one batched multiplexer query.
 #[derive(Clone)]
-struct TmuxState {
+struct MuxState {
     live_panes: HashMap<String, LivePaneInfo>,
     window_statuses: HashMap<String, Option<String>>,
     active_windows: HashSet<(String, String)>,
@@ -57,9 +52,9 @@ struct TmuxState {
 }
 
 /// Query all sidebar-relevant tmux state in a single server observation.
-fn query_tmux_state(tmux: &TmuxBackend) -> Result<TmuxState> {
+fn query_tmux_state(tmux: &TmuxBackend) -> Result<MuxState> {
     let snapshot = tmux.sidebar_snapshot()?;
-    Ok(TmuxState {
+    Ok(MuxState {
         live_panes: snapshot.live_panes,
         window_statuses: snapshot.window_statuses,
         active_windows: snapshot.active_windows,
@@ -75,6 +70,44 @@ fn query_tmux_state(tmux: &TmuxBackend) -> Result<TmuxState> {
         group_by: snapshot.group_by,
         expanded_groups: snapshot.expanded_groups,
     })
+}
+
+fn query_zellij_state(zellij: &ZellijBackend, instance_id: &str) -> Result<MuxState> {
+    let snapshot = zellij.sidebar_snapshot()?;
+    let state = super::session_state::read(instance_id)?;
+    Ok(MuxState {
+        live_panes: snapshot.live_panes,
+        window_statuses: HashMap::new(),
+        active_windows: snapshot.active_windows,
+        pane_window_ids: snapshot.pane_window_ids,
+        pane_window_indexes: snapshot.pane_window_indexes,
+        active_pane_ids: snapshot.active_pane_ids,
+        window_pane_counts: snapshot.window_pane_counts,
+        server_boot_id: None,
+        position: state.position.map(|position| match position {
+            SidebarPosition::Left => "left".to_string(),
+            SidebarPosition::Top => "top".to_string(),
+        }),
+        layout: state.layout,
+        filter: state.filter,
+        sleeping_panes: Some(
+            state
+                .sleeping_panes
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        group_by: state.group_by,
+        expanded_groups: Some(state.expanded_groups.join("\t")),
+    })
+}
+
+fn query_mux_state(mux: &dyn Multiplexer, instance_id: &str) -> Result<MuxState> {
+    match mux.name() {
+        "tmux" => query_tmux_state(&TmuxBackend::for_socket(instance_id)),
+        "zellij" => query_zellij_state(&ZellijBackend::for_session(instance_id), instance_id),
+        name => anyhow::bail!("sidebar is not supported by the {name} backend"),
+    }
 }
 
 struct BroadcastCache {
@@ -2097,7 +2130,7 @@ impl Scheduler {
 pub fn run() -> Result<()> {
     let mux = create_backend(detect_backend());
     let instance_id = mux.instance_id();
-    let tmux = TmuxBackend::for_socket(&instance_id);
+    let tmux = (mux.name() == "tmux").then(|| TmuxBackend::for_socket(&instance_id));
     let config = Arc::new(Mutex::new(Config::load(None)?));
     // Captured at startup and intentionally not live-reloaded. tmux's
     // @workmux_pane_status holds the icon string itself; build_snapshot
@@ -2132,10 +2165,16 @@ pub fn run() -> Result<()> {
     let (pr_cache, check_cache, github_path_tx) =
         spawn_github_worker(term.clone(), publication_dirty.clone(), wake_tx);
 
-    tmux.set_global_option(
-        "@workmux_sidebar_daemon_pid",
-        &std::process::id().to_string(),
-    )?;
+    if let Some(tmux) = &tmux {
+        tmux.set_global_option(
+            "@workmux_sidebar_daemon_pid",
+            &std::process::id().to_string(),
+        )?;
+    } else {
+        super::session_state::update(&instance_id, |state| {
+            state.daemon_pid = Some(std::process::id());
+        })?;
+    }
 
     let mut scheduler = Scheduler::new(Instant::now());
     let mut inactivity_tracker = InactivityTracker::new(Duration::from_secs(10));
@@ -2144,7 +2183,7 @@ pub fn run() -> Result<()> {
     let store = StateStore::new()?;
     let mut agent_state_cache = crate::state::AgentStateCache::default();
     let mut compacted_boot_id: Option<String> = None;
-    let mut cached_inputs: Option<(Vec<crate::multiplexer::AgentPane>, TmuxState)> = None;
+    let mut cached_inputs: Option<(Vec<crate::multiplexer::AgentPane>, MuxState)> = None;
     let mut pending_captures: Option<HashMap<String, String>> = None;
     let mut publish_pending = false;
     let mut last_client_seen = Instant::now();
@@ -2164,7 +2203,21 @@ pub fn run() -> Result<()> {
 
         if scheduler.observation_due(now) {
             scheduler.finish_observation(now);
-            match query_tmux_state(&tmux) {
+            if mux.name() == "zellij"
+                && server.client_count() > 0
+                && super::session_state::read(&instance_id).is_ok_and(|state| state.enabled)
+            {
+                let position = super::session_state::read(&instance_id)
+                    .ok()
+                    .and_then(|state| state.position)
+                    .unwrap_or_default();
+                if let Err(error) =
+                    super::zellij_panes::create_sidebars_in_all_tabs(&instance_id, position, false)
+                {
+                    tracing::warn!(%error, "failed to synchronize Zellij sidebars");
+                }
+            }
+            match query_mux_state(mux.as_ref(), &instance_id) {
                 Ok(tmux_state) => {
                     if tmux_state.server_boot_id != compacted_boot_id {
                         match store.compact_context(
@@ -2214,7 +2267,7 @@ pub fn run() -> Result<()> {
                         }
                     }
                 }
-                Err(error) => tracing::warn!(%error, "failed to query sidebar tmux state"),
+                Err(error) => tracing::warn!(%error, "failed to query sidebar multiplexer state"),
             }
         }
 
@@ -2378,10 +2431,18 @@ pub fn run() -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(" ");
             if agent_list != last_agent_list {
-                let result = if agent_list.is_empty() {
-                    tmux.unset_global_option("@workmux_sidebar_agents")
+                let result = if let Some(tmux) = &tmux {
+                    if agent_list.is_empty() {
+                        tmux.unset_global_option("@workmux_sidebar_agents")
+                    } else {
+                        tmux.set_global_option("@workmux_sidebar_agents", &agent_list)
+                    }
                 } else {
-                    tmux.set_global_option("@workmux_sidebar_agents", &agent_list)
+                    super::session_state::update(&instance_id, |state| {
+                        state.ordered_agents =
+                            agent_list.split_whitespace().map(String::from).collect();
+                    })
+                    .map(|_| ())
                 };
                 if let Err(error) = result {
                     tracing::warn!(%error, "failed to publish sidebar agent inventory");
@@ -2438,10 +2499,17 @@ pub fn run() -> Result<()> {
     if let Ok(store) = StateStore::new() {
         store.delete_runtime(&backend_name, &instance_id);
     }
-    let _ = tmux.unset_global_option("@workmux_sidebar_daemon_pid");
-    let _ = tmux.unset_global_option("@workmux_sidebar_agents");
-    let _ = tmux.unset_global_option("@workmux_sleeping_panes");
-    let _ = tmux.unset_global_option("@workmux_sidebar_scope");
+    if let Some(tmux) = &tmux {
+        let _ = tmux.unset_global_option("@workmux_sidebar_daemon_pid");
+        let _ = tmux.unset_global_option("@workmux_sidebar_agents");
+        let _ = tmux.unset_global_option("@workmux_sleeping_panes");
+        let _ = tmux.unset_global_option("@workmux_sidebar_scope");
+    } else {
+        let _ = super::session_state::update(&instance_id, |state| {
+            state.daemon_pid = None;
+            state.ordered_agents.clear();
+        });
+    }
     Ok(())
 }
 
@@ -2450,7 +2518,7 @@ pub fn run() -> Result<()> {
 /// Inputs gathered from the environment for one daemon tick.
 struct TickInput {
     agents: Vec<crate::multiplexer::AgentPane>,
-    tmux_state: TmuxState,
+    tmux_state: MuxState,
     captured_panes: HashMap<String, String>,
     now: Instant,
     now_ts: u64,
@@ -4319,7 +4387,7 @@ mod tests {
             let output = compute_tick(
                 TickInput {
                     agents,
-                    tmux_state: TmuxState {
+                    tmux_state: MuxState {
                         live_panes: HashMap::new(),
                         window_statuses: HashMap::new(),
                         active_windows: HashSet::new(),

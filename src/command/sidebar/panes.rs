@@ -312,6 +312,15 @@ fn is_own_sidebar(pane_id: &str, own_pane_id: &str) -> bool {
 /// our session from the scope set. Full cleanup (daemon, hooks) only happens
 /// when no scoped sessions remain.
 pub(super) fn shutdown_all_sidebars(identity: &HostIdentity) {
+    let mux = crate::multiplexer::create_backend(crate::multiplexer::detect_backend());
+    if mux.name() == "zellij" {
+        let instance_id = mux.instance_id();
+        let _ = super::session_state::update(&instance_id, |state| state.enabled = false);
+        super::zellij_panes::kill_all_sidebars(&instance_id, Some(&identity.pane_id));
+        kill_daemon();
+        return;
+    }
+
     let config = crate::config::Config::load(None).unwrap_or_default();
     let position = super::read_sidebar_position(&config);
     let our_pane = identity.pane_id.as_str();

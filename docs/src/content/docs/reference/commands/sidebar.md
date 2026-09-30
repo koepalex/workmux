@@ -1,11 +1,11 @@
 ---
 title: "sidebar"
-description: Control a live agent status sidebar in tmux
+description: Control a live agent status sidebar in tmux or Zellij
 ---
 
-Controls a live agent status sidebar on the left or top edge of tmux windows. By default, each sidebar pane shows active agents across all tmux
-sessions with live status updates. Use `workmux sidebar filter session` to show
-only agents in the current tmux session.
+Controls a live agent status sidebar on the left or top edge of tmux windows or
+Zellij tabs. On tmux, each sidebar shows active agents across all sessions by
+default. On Zellij, the sidebar is scoped to the current Zellij session.
 
 ```bash
 workmux sidebar                         # Toggle sidebar on/off (all sessions)
@@ -46,12 +46,13 @@ Each agent row displays:
 
 ## Mouse support
 
-With tmux mouse mode enabled (`set -g mouse on`), click an agent row or top-bar
-chip to jump to its pane, or scroll to navigate the list.
+Click an agent row or top-bar chip to jump to its pane, or scroll to navigate
+the list. tmux requires mouse mode (`set -g mouse on`); Zellij needs no extra
+mouse configuration.
 
 ## Navigation commands
 
-Switch between agents from any tmux pane, in the same order shown in the
+Switch between agents from any pane, in the same order shown in the
 sidebar. Navigation uses the same filter mode as the sidebar view, so it cycles
 through all sessions by default:
 
@@ -147,6 +148,11 @@ sidebar panes, the daemon, and removing hooks. `workmux sidebar on` and
 `workmux sidebar off` provide idempotent alternatives for scripts and tmux
 configuration.
 
+On Zellij, the same daemon polls the current session and creates one sidebar
+pane in every tab. New tabs are detected within about two seconds. Zellij
+restores the remaining layout when sidebars close, so workmux does not install
+hooks or run custom layout reflow.
+
 ### Session-scoped mode
 
 By default, the sidebar appears in all tmux sessions. Use `--session` to scope
@@ -169,7 +175,11 @@ Starting global mode still replaces any session-scoped sidebars.
 
 ## Limitations
 
-- tmux only (other backends are not supported yet)
+- Zellij sidebars are experimental and limited to the current Zellij session.
+- `--session` is equivalent to the default command on Zellij.
+- Zellij sidebars honor width and height on a best-effort basis. Zellij resizes
+  tiled panes in discrete increments, so the closest reachable size may differ
+  by a few columns or rows.
 
 ## Example tmux binding
 
