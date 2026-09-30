@@ -84,6 +84,7 @@ pub(crate) struct ZellijSidebarPane {
 #[derive(Debug, Clone)]
 pub(crate) struct ZellijSidebarTab {
     pub tab_id: u32,
+    pub position: u32,
     pub active: bool,
     pub panes: Vec<ZellijSidebarPane>,
 }
@@ -414,11 +415,33 @@ impl ZellijBackend {
             .ok_or_else(|| anyhow!("Window '{}' not found", full_name))
     }
 
-    fn go_to_tab_by_id(&self, tab_id: u32) -> Result<()> {
+    pub(crate) fn go_to_tab_by_id(&self, tab_id: u32) -> Result<()> {
         self.command()
             .args(&["action", "go-to-tab-by-id", &tab_id.to_string()])
             .run()
             .with_context(|| format!("Failed to switch to zellij tab {}", tab_id))?;
+        Ok(())
+    }
+
+    pub(crate) fn dump_layout(&self) -> Result<String> {
+        self.command()
+            .args(&["action", "dump-layout"])
+            .run_and_capture_stdout()
+            .context("Failed to dump Zellij layout")
+    }
+
+    pub(crate) fn override_active_tab_layout(&self, layout: &str) -> Result<()> {
+        self.command()
+            .args(&[
+                "action",
+                "override-layout",
+                "--apply-only-to-active-tab",
+                "--retain-existing-terminal-panes",
+                "--layout-string",
+                layout,
+            ])
+            .run()
+            .context("Failed to override active Zellij tab layout")?;
         Ok(())
     }
 
@@ -487,6 +510,7 @@ impl ZellijBackend {
             .into_iter()
             .map(|tab| ZellijSidebarTab {
                 tab_id: tab.tab_id,
+                position: tab.position,
                 active: tab.active,
                 panes: panes
                     .iter()
@@ -561,11 +585,19 @@ impl ZellijBackend {
             .map(|_| ())
     }
 
-    fn focus_pane_by_id(&self, pane_id: &str) -> Result<()> {
+    pub(crate) fn focus_pane_by_id(&self, pane_id: &str) -> Result<()> {
         self.command()
             .args(&["action", "focus-pane-id", pane_id])
             .run()
             .with_context(|| format!("Failed to focus zellij pane '{}'", pane_id))?;
+        Ok(())
+    }
+
+    pub(crate) fn move_pane_by_id(&self, pane_id: &str, direction: &str) -> Result<()> {
+        self.command()
+            .args(&["action", "move-pane", "--pane-id", pane_id, direction])
+            .run()
+            .with_context(|| format!("Failed to move zellij pane '{pane_id}' {direction}"))?;
         Ok(())
     }
 }

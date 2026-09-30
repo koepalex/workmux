@@ -142,11 +142,12 @@ and is clamped between 12 and 80. Position changes take effect the next time you
 toggle the sidebar off and on. Use `workmux sidebar --position top` or
 `--position left` to override the configured placement for that toggle.
 
-tmux applies these sizes exactly. Zellij's `new-pane` action starts with a 50/50
-split, after which workmux uses targeted resize actions to move the sidebar
-toward the configured size. The result is the closest size reachable with
-Zellij's resize increment, which can differ by a few columns or rows. Manual
-resizing remains in effect until `workmux sidebar on` is run again.
+tmux and Zellij apply these sizes exactly when the sidebar layout is created.
+For Zellij, workmux wraps the complete existing content tree with
+`override-layout`, so the sidebar takes space proportionally from the existing
+nested layout instead of resizing only the adjacent pane. Running terminal
+panes and focus are retained. Manual resizing remains in effect until
+`workmux sidebar on` is run again.
 
 ## Layout modes
 
@@ -414,10 +415,14 @@ well. It uses a daemon + client architecture with event-driven rendering:
 
 Zellij uses the same daemon and client architecture, scoped to the current
 Zellij session. Stable tab and pane IDs let workmux create one named sidebar
-pane per tab and collect live pane state. Because Zellij has no tmux-style
-new-window hooks, the daemon notices new tabs during its two-second state poll.
-Zellij restores the remaining pane layout when a sidebar closes, so no custom
-layout-tree reflow is needed.
+pane per tab and collect live pane state. To add the sidebar, workmux dumps the
+active tab layout, wraps its complete content tree, and applies one
+`override-layout` operation while retaining running terminal panes. It then
+restores visible pane ordering if Zellij maps anonymous panes by a different
+logical order. Because Zellij has no tmux-style new-window hooks, the daemon
+notices new tabs during its two-second state poll. Zellij restores the
+remaining pane layout when a sidebar closes, so no custom layout-tree reflow is
+needed.
 
 ### Resource usage
 

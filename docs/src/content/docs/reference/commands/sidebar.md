@@ -150,8 +150,11 @@ configuration.
 
 On Zellij, the same daemon polls the current session and creates one sidebar
 pane in every tab. New tabs are detected within about two seconds. Zellij
-restores the remaining layout when sidebars close, so workmux does not install
-hooks or run custom layout reflow.
+sidebars are applied with `override-layout`, retaining running terminal panes
+and wrapping the complete nested content tree. workmux also restores the
+visible pane ordering when Zellij's logical pane order differs from its layout
+order. Zellij restores the remaining layout when sidebars close, so workmux
+does not install hooks or run custom layout reflow.
 
 ### Session-scoped mode
 
@@ -177,9 +180,8 @@ Starting global mode still replaces any session-scoped sidebars.
 
 - Zellij sidebars are experimental and limited to the current Zellij session.
 - `--session` is equivalent to the default command on Zellij.
-- Zellij sidebars honor width and height on a best-effort basis. Zellij resizes
-  tiled panes in discrete increments, so the closest reachable size may differ
-  by a few columns or rows.
+- Fixed sidebar sizes follow Zellij's layout behavior when the terminal itself
+  is resized.
 
 ## Example tmux binding
 

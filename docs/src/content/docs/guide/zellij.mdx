@@ -55,11 +55,11 @@ Closing the sidebar or running `workmux sidebar off` removes it from every tab
 in the session.
 
 Zellij sessions are already isolated, so `workmux sidebar --session` behaves
-the same as `workmux sidebar`. Left and top placement are supported. The
-`new-pane` action starts with a 50/50 split, then workmux uses targeted resize
-actions to apply `sidebar.width`, `sidebar.height`, `--width`, or `--height`.
-Zellij resizes in discrete increments, so the result is the closest reachable
-size rather than always the exact requested value.
+the same as `workmux sidebar`. Left and top placement are supported. workmux
+uses `override-layout` to wrap the complete existing content tree and apply
+`sidebar.width`, `sidebar.height`, `--width`, or `--height` exactly when the
+layout is created. Running terminal panes, focus, and nested split proportions
+are retained.
 
 ## Requirements
 
@@ -117,8 +117,8 @@ next status update rather than clearing when the tab receives focus.
 - Agent status icons do not auto-clear when a tab receives focus
 - Dashboard preview pane is disabled (captures focused pane only)
 - Horizontal and vertical pane splits are always 50/50 (no percentage-based sizing)
-- Sidebar width and height are best effort because Zellij resizes tiled panes
-  in discrete increments
+- Fixed sidebar sizes follow Zellij's layout behavior when the terminal itself
+  is resized
 - Tab insertion ordering is not supported (new tabs always appear at the end)
 - Some edge cases may not be as thoroughly tested as the tmux backend
 
