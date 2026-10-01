@@ -62,6 +62,20 @@ layout is created. Running terminal panes, focus, floating pane coordinates,
 and nested split proportions are retained. Reapplying the sidebar replaces its
 existing panes rather than adding duplicates. Sidebar clients use the Zellij
 backend even when the session runs inside another supported terminal.
+Enabling the sidebar does not launch the configured `panes` again. Temporary
+layout slots are removed without closing user panes, and the built-in tab and
+status bars keep their original plugin aliases.
+
+If an earlier sidebar build has already clipped the bars, reload them in place:
+
+```bash
+zellij action start-or-reload-plugin zellij:tab-bar
+zellij action start-or-reload-plugin zellij:status-bar
+```
+
+This leaves terminal panes running. Unmarked extra shells created by older
+builds must be closed manually; workmux cannot safely distinguish them from
+user-created shells.
 
 ## Requirements
 

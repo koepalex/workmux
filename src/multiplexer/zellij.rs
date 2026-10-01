@@ -27,7 +27,7 @@ pub struct ZellijBackend {
     session_name: Option<String>,
 }
 
-/// Info about a pane from `zellij action list-panes --json --tab --command`
+/// Info about a pane from `zellij action list-panes --json --all`
 #[derive(Debug, serde::Deserialize)]
 struct PaneInfo {
     id: u32,
@@ -59,6 +59,8 @@ struct PaneInfo {
     pane_rows: Option<u16>,
     #[serde(default)]
     title: String,
+    #[serde(default)]
+    plugin_url: Option<String>,
 }
 
 /// Info about a tab from `zellij action list-tabs --json`
@@ -76,9 +78,9 @@ struct TabInfo {
 pub(crate) struct ZellijSidebarPane {
     pub pane_id: String,
     pub title: String,
+    pub command: Option<String>,
     pub is_focused: bool,
     pub is_floating: bool,
-    pub is_default_shell: bool,
     pub pane_x: Option<u16>,
     pub pane_y: Option<u16>,
     pub pane_columns: Option<u16>,
@@ -91,6 +93,7 @@ pub(crate) struct ZellijSidebarTab {
     pub position: u32,
     pub active: bool,
     pub panes: Vec<ZellijSidebarPane>,
+    pub ui_plugin_aliases: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -343,15 +346,12 @@ impl ZellijBackend {
         parse_tab_name_from_output(&output)
     }
 
-    /// Query all panes using `zellij action list-panes --json --tab --command`
-    ///
-    /// The `--tab` flag includes `tab_id`, `tab_name`, `tab_position`.
-    /// The `--command` flag includes `pane_command`, `pane_cwd`.
+    /// Include non-selectable UI plugins as well as tab, command, and geometry fields.
     fn list_panes(&self) -> Result<Vec<PaneInfo>> {
         query_json_with_retry(
             || {
                 self.command()
-                    .args(&["action", "list-panes", "--json", "--tab", "--command"])
+                    .args(&["action", "list-panes", "--json", "--all"])
                     .run_and_capture_stdout()
                     .context("Failed to list panes")
             },
@@ -449,6 +449,15 @@ impl ZellijBackend {
         Ok(())
     }
 
+    pub(crate) fn reapply_active_tab_layout(&self) -> Result<()> {
+        // Sidebar overrides install only a base layout, so cycling reapplies it without spawning.
+        self.command()
+            .args(&["action", "next-swap-layout"])
+            .run()
+            .context("Failed to reapply active Zellij tab layout")?;
+        Ok(())
+    }
+
     fn tab_id_for_pane(&self, pane_id: &str) -> Result<Option<u32>> {
         let numeric_id =
             parse_pane_id(pane_id).ok_or_else(|| anyhow!("Invalid pane_id: {}", pane_id))?;
@@ -516,15 +525,25 @@ impl ZellijBackend {
                 tab_id: tab.tab_id,
                 position: tab.position,
                 active: tab.active,
+                ui_plugin_aliases: panes
+                    .iter()
+                    .filter(|pane| pane.is_plugin && pane.tab_id == Some(tab.tab_id))
+                    .filter_map(|pane| pane.plugin_url.as_deref())
+                    .filter(|url| matches!(*url, "tab-bar" | "status-bar"))
+                    .map(str::to_owned)
+                    .collect(),
                 panes: panes
                     .iter()
                     .filter(|pane| !pane.is_plugin && pane.tab_id == Some(tab.tab_id))
                     .map(|pane| ZellijSidebarPane {
                         pane_id: format!("terminal_{}", pane.id),
                         title: pane.title.clone(),
+                        command: pane
+                            .pane_command
+                            .clone()
+                            .or_else(|| pane.terminal_command.clone()),
                         is_focused: pane.is_focused,
                         is_floating: pane.is_floating,
-                        is_default_shell: pane.terminal_command.is_none(),
                         pane_x: pane.pane_x,
                         pane_y: pane.pane_y,
                         pane_columns: pane.pane_columns,
@@ -1367,6 +1386,7 @@ mod tests {
             pane_columns: None,
             pane_rows: None,
             title: String::new(),
+            plugin_url: None,
         }
     }
 

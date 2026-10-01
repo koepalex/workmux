@@ -105,7 +105,10 @@ args = args[3:]
 model["calls"].append(args)
 action = args[0]
 if action == "list-panes":
-    print(json.dumps(model["panes"]))
+    print(json.dumps([
+        pane for pane in model["panes"]
+        if "--all" in args or pane.get("is_selectable", True)
+    ]))
 elif action == "list-tabs":
     print(json.dumps(model.get("tabs", [{"tab_id": 0, "position": 0, "name": "one", "active": True}])))
 elif action == "current-tab-info":
@@ -116,12 +119,24 @@ elif action == "override-layout":
     layout = args[args.index("--layout-string") + 1]
     model["applied_layout"] = layout
     marker = re.search(r'name="(workmux-sidebar-placeholder-[^"]+)"', layout)
-    for pane_id, title in [
-        (9, "concurrent editor"),
-        (10, marker[1] if marker else "shell"),
-        (11, "workmux-sidebar"),
+    for pane_id, title, pane_command in [
+        (9, "concurrent editor", "zsh"),
+        (
+            10,
+            "Pane #3",
+            f'env WORKMUX_SIDEBAR_PLACEHOLDER={marker[1]} true' if marker else "env true",
+        ),
+        (11, "workmux-sidebar", "env WORKMUX_BACKEND=zellij workmux _sidebar-run"),
     ]:
-        model["panes"].append(model["panes"][0] | {"id": pane_id, "title": title, "is_focused": False})
+        model["panes"].append(
+            model["panes"][0]
+            | {
+                "id": pane_id,
+                "title": title,
+                "pane_command": pane_command,
+                "is_focused": False,
+            }
+        )
 elif action == "close-pane":
     pane_id = int(args[args.index("--pane-id") + 1].removeprefix("terminal_"))
     model["closed"].append(pane_id)
@@ -134,7 +149,7 @@ elif action == "go-to-tab-by-id":
     tab_id = int(args[1])
     for tab in model.get("tabs", []):
         tab["active"] = tab["tab_id"] == tab_id
-elif action in ("focus-pane-id", "change-floating-pane-coordinates"):
+elif action in ("focus-pane-id", "change-floating-pane-coordinates", "next-swap-layout"):
     pass
 else:
     raise AssertionError(args)
@@ -209,6 +224,39 @@ def test_layout_cleanup_preserves_concurrently_opened_panes(sidebar: SidebarHarn
     assert 9 not in model["closed"]
     assert 10 in model["closed"]
     assert 1 not in model["closed"]
+
+
+@pytest.mark.parametrize("use_alias", [True, False])
+def test_layout_preserves_builtin_plugin_invocations(
+    sidebar: SidebarHarness, use_alias: bool
+):
+    model = sidebar.model()
+    for pane_id, name in [(2, "tab-bar"), (3, "status-bar")]:
+        model["panes"].append(
+            model["panes"][0]
+            | {
+                "id": pane_id,
+                "is_plugin": True,
+                "is_selectable": False,
+                "title": f"custom {name}",
+                "plugin_url": name if use_alias else f"zellij:{name}",
+            }
+        )
+    model["layout"] = """
+        layout {
+            tab focus=true {
+                pane size=1 borderless=true { plugin location="zellij:tab-bar"; }
+                pane
+                pane size=1 borderless=true { plugin location="zellij:status-bar"; }
+            }
+        }
+    """
+    sidebar.save_model(model)
+    sidebar.run("on")
+    layout = sidebar.model()["applied_layout"]
+    for name in ["tab-bar", "status-bar"]:
+        location = name if use_alias else f"zellij:{name}"
+        assert f'plugin location="{location}"' in layout
 
 
 def test_navigation_to_already_focused_pane_succeeds(sidebar: SidebarHarness):
