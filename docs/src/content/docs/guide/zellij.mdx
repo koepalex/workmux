@@ -58,8 +58,10 @@ Zellij sessions are already isolated, so `workmux sidebar --session` behaves
 the same as `workmux sidebar`. Left and top placement are supported. workmux
 uses `override-layout` to wrap the complete existing content tree and apply
 `sidebar.width`, `sidebar.height`, `--width`, or `--height` exactly when the
-layout is created. Running terminal panes, focus, and nested split proportions
-are retained.
+layout is created. Running terminal panes, focus, floating pane coordinates,
+and nested split proportions are retained. Reapplying the sidebar replaces its
+existing panes rather than adding duplicates. Sidebar clients use the Zellij
+backend even when the session runs inside another supported terminal.
 
 ## Requirements
 

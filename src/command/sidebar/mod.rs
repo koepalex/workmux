@@ -275,16 +275,16 @@ fn configured_position(
 
 pub(super) fn read_sidebar_position(config: &crate::config::Config) -> SidebarPosition {
     let mux = create_backend(detect_backend());
-    if mux.name() == "zellij"
-        && let Ok(state) = session_state::read(&mux.instance_id())
-        && let Some(position) = state.position
-    {
-        return position;
-    }
-
-    if let Ok(output) = Cmd::new("tmux")
-        .args(&["show-option", "-gqv", "@workmux_sidebar_position"])
-        .run_and_capture_stdout()
+    if mux.name() == "zellij" {
+        if let Ok(state) = session_state::read(&mux.instance_id())
+            && let Some(position) = state.position
+        {
+            return position;
+        }
+    } else if mux.name() == "tmux"
+        && let Ok(output) = Cmd::new("tmux")
+            .args(&["show-option", "-gqv", "@workmux_sidebar_position"])
+            .run_and_capture_stdout()
     {
         match output.trim() {
             "top" => return SidebarPosition::Top,
@@ -855,10 +855,9 @@ pub fn sync(window_id: Option<&str>) -> Result<()> {
         let instance_id = mux.instance_id();
         let state = session_state::read(&instance_id)?;
         if state.enabled {
-            zellij_panes::create_sidebars_in_all_tabs(
+            zellij_panes::create_sidebar_in_active_tab(
                 &instance_id,
                 state.position.unwrap_or_default(),
-                false,
             )?;
         }
         return Ok(());
@@ -1032,16 +1031,16 @@ fn parse_sidebar_filter_mode(raw: &str) -> Result<app::SidebarFilterMode> {
 
 fn read_sidebar_filter_mode() -> app::SidebarFilterMode {
     let mux = create_backend(detect_backend());
-    if mux.name() == "zellij"
-        && let Ok(state) = session_state::read(&mux.instance_id())
-        && let Some(mode) = state.filter
-    {
-        return parse_sidebar_filter_mode(&mode).unwrap_or_default();
-    }
-
-    if let Ok(output) = Cmd::new("tmux")
-        .args(&["show-option", "-gqv", "@workmux_sidebar_filter"])
-        .run_and_capture_stdout()
+    if mux.name() == "zellij" {
+        if let Ok(state) = session_state::read(&mux.instance_id())
+            && let Some(mode) = state.filter
+        {
+            return parse_sidebar_filter_mode(&mode).unwrap_or_default();
+        }
+    } else if mux.name() == "tmux"
+        && let Ok(output) = Cmd::new("tmux")
+            .args(&["show-option", "-gqv", "@workmux_sidebar_filter"])
+            .run_and_capture_stdout()
     {
         let trimmed = output.trim();
         if !trimmed.is_empty() {
@@ -1133,22 +1132,22 @@ pub fn set_group_by(mode: Option<&str>, clear: bool) -> Result<()> {
     Ok(())
 }
 
-/// Grouping currently in effect: the tmux override, else the persisted one,
+/// Grouping currently in effect: the backend override, else the persisted one,
 /// else what the config asks for.
 fn read_sidebar_group_by(
     configured: Option<crate::config::SidebarGroupBy>,
 ) -> Option<crate::config::SidebarGroupBy> {
     let mux = create_backend(detect_backend());
-    if mux.name() == "zellij"
-        && let Ok(state) = session_state::read(&mux.instance_id())
-        && let Some(mode) = state.group_by
-    {
-        return parse_sidebar_group_by(&mode).unwrap_or(configured);
-    }
-
-    if let Ok(output) = Cmd::new("tmux")
-        .args(&["show-option", "-gqv", "@workmux_sidebar_group_by"])
-        .run_and_capture_stdout()
+    if mux.name() == "zellij" {
+        if let Ok(state) = session_state::read(&mux.instance_id())
+            && let Some(mode) = state.group_by
+        {
+            return parse_sidebar_group_by(&mode).unwrap_or(configured);
+        }
+    } else if mux.name() == "tmux"
+        && let Ok(output) = Cmd::new("tmux")
+            .args(&["show-option", "-gqv", "@workmux_sidebar_group_by"])
+            .run_and_capture_stdout()
     {
         let trimmed = output.trim();
         if !trimmed.is_empty() {

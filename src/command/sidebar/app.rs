@@ -1300,7 +1300,10 @@ impl SidebarApp {
             && let Some(agent) = self.agents.get(idx)
         {
             let pane_id = agent.pane_id.clone();
-            let _ = self.mux.switch_to_pane(&pane_id, None);
+            if let Err(error) = self.mux.switch_to_pane(&pane_id, None) {
+                warn!(%error, %pane_id, "failed to navigate to sidebar agent");
+                return;
+            }
             // Signal daemon directly to bypass tmux hook round-trip latency
             super::daemon_ctrl::signal_daemon_for(self.mux.as_ref());
         }

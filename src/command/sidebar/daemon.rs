@@ -2250,7 +2250,7 @@ pub fn run() -> Result<()> {
                     .and_then(|state| state.position)
                     .unwrap_or_default();
                 if let Err(error) =
-                    super::zellij_panes::create_sidebars_in_all_tabs(&instance_id, position, false)
+                    super::zellij_panes::create_sidebar_in_active_tab(&instance_id, position)
                 {
                     tracing::warn!(%error, "failed to synchronize Zellij sidebars");
                 }

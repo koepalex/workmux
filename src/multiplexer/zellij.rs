@@ -33,6 +33,8 @@ struct PaneInfo {
     id: u32,
     is_plugin: bool,
     is_focused: bool,
+    #[serde(default)]
+    is_floating: bool,
     terminal_command: Option<String>,
     /// Running command (more reliable than terminal_command, available with --command flag)
     #[serde(default)]
@@ -75,6 +77,8 @@ pub(crate) struct ZellijSidebarPane {
     pub pane_id: String,
     pub title: String,
     pub is_focused: bool,
+    pub is_floating: bool,
+    pub is_default_shell: bool,
     pub pane_x: Option<u16>,
     pub pane_y: Option<u16>,
     pub pane_columns: Option<u16>,
@@ -519,6 +523,8 @@ impl ZellijBackend {
                         pane_id: format!("terminal_{}", pane.id),
                         title: pane.title.clone(),
                         is_focused: pane.is_focused,
+                        is_floating: pane.is_floating,
+                        is_default_shell: pane.terminal_command.is_none(),
                         pane_x: pane.pane_x,
                         pane_y: pane.pane_y,
                         pane_columns: pane.pane_columns,
@@ -586,10 +592,20 @@ impl ZellijBackend {
     }
 
     pub(crate) fn focus_pane_by_id(&self, pane_id: &str) -> Result<()> {
-        self.command()
+        if let Err(error) = self
+            .command()
             .args(&["action", "focus-pane-id", pane_id])
             .run()
-            .with_context(|| format!("Failed to focus zellij pane '{}'", pane_id))?;
+        {
+            // Zellij reports an error for an already-focused pane; navigation is idempotent.
+            if let Some(id) = parse_pane_id(pane_id)
+                && error.to_string().lines().last()
+                    == Some(format!("Pane Terminal({id}) is already focused").as_str())
+            {
+                return Ok(());
+            }
+            return Err(error).with_context(|| format!("Failed to focus zellij pane '{pane_id}'"));
+        }
         Ok(())
     }
 
@@ -598,6 +614,34 @@ impl ZellijBackend {
             .args(&["action", "move-pane", "--pane-id", pane_id, direction])
             .run()
             .with_context(|| format!("Failed to move zellij pane '{pane_id}' {direction}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn set_floating_pane_coordinates(
+        &self,
+        pane_id: &str,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> Result<()> {
+        self.command()
+            .args(&[
+                "action",
+                "change-floating-pane-coordinates",
+                "--pane-id",
+                pane_id,
+                "--x",
+                &x.to_string(),
+                "--y",
+                &y.to_string(),
+                "--width",
+                &width.to_string(),
+                "--height",
+                &height.to_string(),
+            ])
+            .run()
+            .with_context(|| format!("Failed to restore floating Zellij pane '{pane_id}'"))?;
         Ok(())
     }
 }
@@ -915,34 +959,8 @@ impl Multiplexer for ZellijBackend {
         Ok(())
     }
 
-    fn switch_to_pane(&self, pane_id: &str, window_hint: Option<&str>) -> Result<()> {
-        // Zellij can't switch to arbitrary panes by ID, so switch to the containing tab.
-        let tab_name = window_hint.ok_or_else(|| {
-            anyhow!(
-                "Zellij switch_to_pane requires window_hint (tab name) for pane '{}'",
-                pane_id
-            )
-        })?;
-
-        debug!(pane_id, tab_name, "switch_to_pane: switching to tab");
-
-        // Try to switch by tab ID for more reliability
-        let tabs = self.list_tabs()?;
-        if let Some(tab) = tabs.iter().find(|t| t.name == tab_name) {
-            let tab_id = tab.tab_id().to_string();
-            self.command()
-                .args(&["action", "go-to-tab-by-id", &tab_id])
-                .run()
-                .with_context(|| format!("Failed to switch to tab '{}' by ID", tab_name))?;
-        } else {
-            // Fallback to name-based switch
-            self.command()
-                .args(&["action", "go-to-tab-name", tab_name])
-                .run()
-                .with_context(|| format!("Failed to switch to tab '{}'", tab_name))?;
-        }
-
-        Ok(())
+    fn switch_to_pane(&self, pane_id: &str, _window_hint: Option<&str>) -> Result<()> {
+        self.focus_pane_by_id(pane_id)
     }
 
     fn kill_pane(&self, pane_id: &str) -> Result<()> {
@@ -1337,6 +1355,7 @@ mod tests {
             id,
             is_plugin,
             is_focused: false,
+            is_floating: false,
             terminal_command: None,
             pane_command: None,
             pane_cwd: None,
