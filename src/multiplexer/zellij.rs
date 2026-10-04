@@ -106,6 +106,12 @@ pub(crate) struct ZellijSidebarSnapshot {
     pub window_pane_counts: std::collections::HashMap<String, usize>,
 }
 
+#[derive(Debug)]
+pub(crate) struct ZellijSidebarObservation {
+    pub tabs: Vec<ZellijSidebarTab>,
+    pub snapshot: ZellijSidebarSnapshot,
+}
+
 impl TabInfo {
     /// Get stable tab ID
     fn tab_id(&self) -> u32 {
@@ -516,11 +522,8 @@ impl ZellijBackend {
         }
     }
 
-    pub(crate) fn sidebar_tabs(&self) -> Result<Vec<ZellijSidebarTab>> {
-        let panes = self.list_panes()?;
-        let tabs = self.list_tabs()?;
-        Ok(tabs
-            .into_iter()
+    fn build_sidebar_tabs(&self, panes: &[PaneInfo], tabs: &[TabInfo]) -> Vec<ZellijSidebarTab> {
+        tabs.iter()
             .map(|tab| ZellijSidebarTab {
                 tab_id: tab.tab_id,
                 position: tab.position,
@@ -551,13 +554,15 @@ impl ZellijBackend {
                     })
                     .collect(),
             })
-            .collect())
+            .collect()
     }
 
-    pub(crate) fn sidebar_snapshot(&self) -> Result<ZellijSidebarSnapshot> {
+    fn build_sidebar_snapshot(
+        &self,
+        panes: &[PaneInfo],
+        tabs: &[TabInfo],
+    ) -> ZellijSidebarSnapshot {
         let session = self.session_name().unwrap_or_else(|| "default".to_string());
-        let panes = self.list_panes()?;
-        let tabs = self.list_tabs()?;
         let mut snapshot = ZellijSidebarSnapshot {
             live_panes: std::collections::HashMap::new(),
             active_windows: std::collections::HashSet::new(),
@@ -599,7 +604,20 @@ impl ZellijBackend {
             }
         }
 
-        Ok(snapshot)
+        snapshot
+    }
+
+    pub(crate) fn sidebar_observation(&self) -> Result<ZellijSidebarObservation> {
+        let panes = self.list_panes()?;
+        let tabs = self.list_tabs()?;
+        Ok(ZellijSidebarObservation {
+            tabs: self.build_sidebar_tabs(&panes, &tabs),
+            snapshot: self.build_sidebar_snapshot(&panes, &tabs),
+        })
+    }
+
+    pub(crate) fn sidebar_tabs(&self) -> Result<Vec<ZellijSidebarTab>> {
+        Ok(self.sidebar_observation()?.tabs)
     }
 
     pub(crate) fn close_pane_by_id(&self, pane_id: &str) -> Result<()> {

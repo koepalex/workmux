@@ -21,7 +21,7 @@ use crate::git::GitStatus;
 use crate::github::{CheckSummary, PrSummary};
 use crate::multiplexer::{
     AgentPane, LivePaneInfo, Multiplexer, TmuxBackend, create_backend, detect_backend,
-    zellij::ZellijBackend,
+    zellij::{ZellijBackend, ZellijSidebarTab},
 };
 use crate::state::StateStore;
 
@@ -73,40 +73,57 @@ fn query_tmux_state(tmux: &TmuxBackend) -> Result<MuxState> {
     })
 }
 
-fn query_zellij_state(zellij: &ZellijBackend, instance_id: &str) -> Result<MuxState> {
-    let snapshot = zellij.sidebar_snapshot()?;
+fn query_zellij_state(
+    zellij: &ZellijBackend,
+    instance_id: &str,
+) -> Result<(MuxState, Vec<ZellijSidebarTab>)> {
+    let observation = zellij.sidebar_observation()?;
+    let snapshot = observation.snapshot;
     let state = super::session_state::read(instance_id)?;
-    Ok(MuxState {
-        live_panes: snapshot.live_panes,
-        window_statuses: HashMap::new(),
-        active_windows: snapshot.active_windows,
-        pane_window_ids: snapshot.pane_window_ids,
-        pane_window_indexes: snapshot.pane_window_indexes,
-        active_pane_ids: snapshot.active_pane_ids,
-        window_pane_counts: snapshot.window_pane_counts,
-        server_boot_id: None,
-        position: state.position.map(|position| match position {
-            SidebarPosition::Left => "left".to_string(),
-            SidebarPosition::Top => "top".to_string(),
-        }),
-        layout: state.layout,
-        filter: state.filter,
-        sleeping_panes: Some(
-            state
-                .sleeping_panes
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
-        group_by: state.group_by,
-        expanded_groups: Some(state.expanded_groups.join("\t")),
-    })
+    Ok((
+        MuxState {
+            live_panes: snapshot.live_panes,
+            window_statuses: HashMap::new(),
+            active_windows: snapshot.active_windows,
+            pane_window_ids: snapshot.pane_window_ids,
+            pane_window_indexes: snapshot.pane_window_indexes,
+            active_pane_ids: snapshot.active_pane_ids,
+            window_pane_counts: snapshot.window_pane_counts,
+            server_boot_id: None,
+            position: state.position.map(|position| match position {
+                SidebarPosition::Left => "left".to_string(),
+                SidebarPosition::Top => "top".to_string(),
+            }),
+            layout: state.layout,
+            filter: state.filter,
+            sleeping_panes: Some(
+                state
+                    .sleeping_panes
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            group_by: state.group_by,
+            expanded_groups: Some(state.expanded_groups.join("\t")),
+        },
+        observation.tabs,
+    ))
 }
 
-fn query_mux_state(mux: &dyn Multiplexer, instance_id: &str) -> Result<MuxState> {
+fn query_mux_state(
+    mux: &dyn Multiplexer,
+    instance_id: &str,
+) -> Result<(MuxState, Option<Vec<ZellijSidebarTab>>)> {
     match mux.name() {
-        "tmux" => query_tmux_state(&TmuxBackend::for_socket(instance_id)),
-        "zellij" => query_zellij_state(&ZellijBackend::for_session(instance_id), instance_id),
+        "tmux" => Ok((
+            query_tmux_state(&TmuxBackend::for_socket(instance_id))?,
+            None,
+        )),
+        "zellij" => {
+            let (state, tabs) =
+                query_zellij_state(&ZellijBackend::for_session(instance_id), instance_id)?;
+            Ok((state, Some(tabs)))
+        }
         name => anyhow::bail!("sidebar is not supported by the {name} backend"),
     }
 }
@@ -2241,22 +2258,21 @@ pub fn run() -> Result<()> {
 
         if scheduler.observation_due(now) {
             scheduler.finish_observation(now);
-            if mux.name() == "zellij"
-                && server.client_count() > 0
-                && super::session_state::read(&instance_id).is_ok_and(|state| state.enabled)
-            {
-                let position = super::session_state::read(&instance_id)
-                    .ok()
-                    .and_then(|state| state.position)
-                    .unwrap_or_default();
-                if let Err(error) =
-                    super::zellij_panes::create_sidebar_in_active_tab(&instance_id, position)
-                {
-                    tracing::warn!(%error, "failed to synchronize Zellij sidebars");
-                }
-            }
             match query_mux_state(mux.as_ref(), &instance_id) {
-                Ok(tmux_state) => {
+                Ok((tmux_state, zellij_tabs)) => {
+                    if let Some(tabs) = zellij_tabs
+                        && server.client_count() > 0
+                        && let Ok(state) = super::session_state::read(&instance_id)
+                        && state.enabled
+                        && let Err(error) =
+                            super::zellij_panes::create_sidebar_in_active_tab_from_snapshot(
+                                &instance_id,
+                                state.position.unwrap_or_default(),
+                                &tabs,
+                            )
+                    {
+                        tracing::warn!(%error, "failed to synchronize Zellij sidebars");
+                    }
                     if tmux_state.server_boot_id != compacted_boot_id {
                         match store.compact_context(
                             &backend_name,

@@ -543,6 +543,25 @@ fn create_sidebar_in_tab(
     else {
         return Ok(());
     };
+    create_sidebar_in_tab_from_snapshot(
+        instance_id,
+        &tab,
+        position,
+        config,
+        replace_existing,
+        select_tab,
+    )
+}
+
+fn create_sidebar_in_tab_from_snapshot(
+    instance_id: &str,
+    tab: &ZellijSidebarTab,
+    position: SidebarPosition,
+    config: &Config,
+    replace_existing: bool,
+    select_tab: bool,
+) -> Result<()> {
+    let mux = backend(instance_id);
     if tab.panes.iter().any(|pane| is_sidebar_pane(&pane.title)) && !replace_existing {
         return Ok(());
     }
@@ -681,6 +700,24 @@ pub(super) fn create_sidebar_in_active_tab(
     create_sidebar_in_tab(instance_id, &tab, position, &config, false, false)
 }
 
+pub(super) fn create_sidebar_in_active_tab_from_snapshot(
+    instance_id: &str,
+    position: SidebarPosition,
+    tabs: &[ZellijSidebarTab],
+) -> Result<()> {
+    let Some(tab) = tabs.iter().find(|tab| tab.active) else {
+        return Ok(());
+    };
+    if tab.panes.iter().any(|pane| is_sidebar_pane(&pane.title)) {
+        return Ok(());
+    }
+    let state = super::session_state::read(instance_id)?;
+    let mut config = Config::load(None)?;
+    config.sidebar.width = state.width;
+    config.sidebar.height = state.height;
+    create_sidebar_in_tab_from_snapshot(instance_id, tab, position, &config, false, false)
+}
+
 pub(super) fn current_tab_has_sidebar(instance_id: &str) -> Result<bool> {
     Ok(backend(instance_id)
         .sidebar_tabs()?
@@ -731,6 +768,34 @@ mod tests {
             placeholder_name: "workmux-sidebar-placeholder-test",
             ui_plugin_aliases: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn active_sidebar_snapshot_skips_another_zellij_query() {
+        let tabs = [ZellijSidebarTab {
+            tab_id: 1,
+            position: 0,
+            active: true,
+            panes: vec![ZellijSidebarPane {
+                pane_id: "terminal_1".to_string(),
+                title: SIDEBAR_PANE_NAME.to_string(),
+                command: None,
+                is_focused: true,
+                is_floating: false,
+                pane_x: Some(0),
+                pane_y: Some(0),
+                pane_columns: Some(24),
+                pane_rows: Some(40),
+            }],
+            ui_plugin_aliases: HashSet::new(),
+        }];
+
+        create_sidebar_in_active_tab_from_snapshot(
+            "no-zellij-process-should-be-started",
+            SidebarPosition::Left,
+            &tabs,
+        )
+        .unwrap();
     }
 
     #[test]
