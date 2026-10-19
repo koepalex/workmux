@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 use std::collections::HashSet;
+use std::path::Path;
 use tracing::debug;
 
 use crate::config::{Config, SidebarHeight, SidebarPosition, SidebarWidth};
@@ -269,6 +270,8 @@ fn remove_existing_sidebar(node: &mut KdlNode) {
 struct RetainedContent<'a> {
     placeholder_name: &'a str,
     ui_plugin_aliases: HashSet<String>,
+    // Relative pane cwds are resolved against this because the override layout has no global cwd.
+    base_cwd: Option<String>,
 }
 
 fn prepare_retained_content(node: &mut KdlNode, retained: &RetainedContent<'_>) {
@@ -279,6 +282,8 @@ fn prepare_retained_content(node: &mut KdlNode, retained: &RetainedContent<'_>) 
     {
         return;
     }
+    let is_plain_shell = node.get("command").is_none();
+    let cwd = node.get("cwd").cloned();
     for property in ["command", "cwd", "name", "close_on_exit", "start_suspended"] {
         remove_property(node, property);
     }
@@ -293,7 +298,19 @@ fn prepare_retained_content(node: &mut KdlNode, retained: &RetainedContent<'_>) 
             *node.children_mut() = None;
         }
     }
-    if node.children().is_none() {
+    if node.children().is_none() && is_plain_shell {
+        // A bare slot matches the running shell exactly, so Zellij keeps it in place
+        // instead of spawning a replacement and appending the original.
+        if let Some(cwd) = cwd.as_ref().and_then(KdlValue::as_string) {
+            let resolved = match &retained.base_cwd {
+                Some(base) if !Path::new(cwd).is_absolute() => {
+                    Path::new(base).join(cwd).to_string_lossy().into_owned()
+                }
+                _ => cwd.to_string(),
+            };
+            property(node, "cwd", resolved);
+        }
+    } else if node.children().is_none() {
         let placeholder_name = retained.placeholder_name;
         // Bare slots can spawn unmarked shells when their cwd differs from the original invocation.
         // Mark every temporary slot so cleanup cannot mistake a user pane for a placeholder.
@@ -349,6 +366,16 @@ fn layout_with_sidebar(
         .ok_or_else(|| anyhow!("dumped Zellij layout has no layout node"))?;
     let mut tab = active_dumped_tab(layout, tab_position)
         .ok_or_else(|| anyhow!("dumped Zellij layout has no target tab"))?;
+    let retained = &RetainedContent {
+        placeholder_name: retained.placeholder_name,
+        ui_plugin_aliases: retained.ui_plugin_aliases.clone(),
+        base_cwd: layout
+            .children()
+            .and_then(|children| children.get("cwd"))
+            .and_then(|cwd| cwd.get(0))
+            .and_then(KdlValue::as_string)
+            .map(str::to_owned),
+    };
     remove_existing_sidebar(&mut tab);
     let original_direction = tab.get("split_direction").cloned();
     let original_children = tab
@@ -423,9 +450,6 @@ fn layout_with_sidebar(
 
     let mut root = KdlNode::new("layout");
     let mut root_children = KdlDocument::new();
-    if let Some(cwd) = layout.children().and_then(|children| children.get("cwd")) {
-        root_children.nodes_mut().push(cwd.clone());
-    }
     root_children.nodes_mut().push(tab);
     root.set_children(root_children);
     let mut output = KdlDocument::new();
@@ -619,6 +643,7 @@ fn create_sidebar_in_tab_from_snapshot(
         &RetainedContent {
             placeholder_name: &placeholder_name,
             ui_plugin_aliases: tab.ui_plugin_aliases.clone(),
+            base_cwd: None,
         },
     )?;
     for pane in tab.panes.iter().filter(|pane| is_sidebar_pane(&pane.title)) {
@@ -767,6 +792,7 @@ mod tests {
         RetainedContent {
             placeholder_name: "workmux-sidebar-placeholder-test",
             ui_plugin_aliases: HashSet::new(),
+            base_cwd: None,
         }
     }
 
@@ -799,10 +825,10 @@ mod tests {
     }
 
     #[test]
-    fn marks_all_terminal_slots_including_default_shells() {
+    fn marks_command_slots_and_keeps_default_shell_slots_bare() {
         let retained = retained_content();
         let output = layout_with_sidebar(
-            "layout { tab { pane split_direction=\"vertical\" { pane; pane; }; }; }",
+            "layout { tab { pane split_direction=\"vertical\" { pane; pane command=\"sleep\"; }; }; }",
             0,
             SidebarPosition::Left,
             KdlValue::Integer(24),
@@ -813,10 +839,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             output.matches("WORKMUX_SIDEBAR_PLACEHOLDER=").count(),
-            2,
+            1,
             "{output}"
         );
-        assert_eq!(output.matches("command=").count(), 3, "{output}");
+        assert_eq!(output.matches("command=").count(), 2, "{output}");
     }
 
     #[test]
@@ -840,13 +866,13 @@ mod tests {
     }
 
     #[test]
-    fn preserves_ui_plugin_aliases_and_inherited_cwd() {
+    fn resolves_relative_shell_cwd_instead_of_inheriting_it() {
         let dumped = r#"
             layout {
                 cwd "/original"
                 tab {
                     pane size=1 borderless=true { plugin location="zellij:tab-bar"; }
-                    pane
+                    pane cwd="sub"
                     pane size=1 borderless=true { plugin location="zellij:status-bar"; }
                 }
             }
@@ -864,7 +890,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(output.contains("cwd \"/original\""), "{output}");
+        assert!(output.contains("cwd=\"/original/sub\""), "{output}");
+        assert!(!output.contains("cwd \"/original\""), "{output}");
         assert!(output.contains("plugin location=\"tab-bar\""), "{output}");
         assert!(
             output.contains("plugin location=\"status-bar\""),

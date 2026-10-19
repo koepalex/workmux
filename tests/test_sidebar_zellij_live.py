@@ -290,3 +290,32 @@ def test_damaged_bars_can_be_reloaded_without_closing_panes(live_zellij: LiveZel
             and live_zellij.screen.display[-1].startswith(bottom_prefix)
         )
     ), live_zellij.screen.display
+
+
+@pytest.mark.parametrize("position", ["left", "top"])
+@pytest.mark.parametrize(
+    ("variant", "count"),
+    [("shell", 3), ("shell", 4), ("cwd", 3), ("cwd", 4), ("command", 3)],
+)
+def test_sidebar_keeps_side_by_side_row(
+    live_zellij: LiveZellij, position: str, count: int, variant: str
+):
+    for _ in range(count - 1):
+        args = ["new-pane", "--direction", "right"]
+        if variant == "cwd":
+            args += ["--cwd", "/tmp"]
+        if variant == "command":
+            args += ["--", "sleep", "300"]
+        live_zellij.action(*args)
+    original_ids = {
+        pane["id"] for pane in live_zellij.panes() if not pane["is_plugin"]
+    }
+
+    live_zellij.sidebar("on", "--position", position)
+
+    terminals = [pane for pane in live_zellij.panes() if not pane["is_plugin"]]
+    content = [pane for pane in terminals if pane["id"] in original_ids]
+    assert len(terminals) == count + 1, terminals
+    assert len(content) == count, terminals
+    assert len({pane["pane_y"] for pane in content}) == 1, content
+    assert len({pane["pane_rows"] for pane in content}) == 1, content
