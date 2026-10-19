@@ -327,6 +327,69 @@ fn prepare_retained_content(node: &mut KdlNode, retained: &RetainedContent<'_>) 
     }
 }
 
+fn leaf_count(node: &KdlNode) -> usize {
+    match node.children() {
+        Some(children) if children.nodes().iter().any(|c| c.name().value() == "pane") => children
+            .nodes()
+            .iter()
+            .filter(|c| c.name().value() == "pane")
+            .map(leaf_count)
+            .sum(),
+        _ => 1,
+    }
+}
+
+fn has_command_pane(node: &KdlNode) -> bool {
+    node.name().value() == "pane"
+        && (node.get("command").is_some()
+            || node
+                .children()
+                .is_some_and(|children| children.nodes().iter().any(has_command_pane)))
+}
+
+// Leaves lose their sizes: percentages from a dump rarely sum to 100 and Zellij then rejects the layout.
+fn bare_slots(node: &KdlNode) -> KdlNode {
+    let mut slot = KdlNode::new("pane");
+    let Some(children) = node.children().filter(|children| {
+        children
+            .nodes()
+            .iter()
+            .any(|child| child.name().value() == "pane")
+    }) else {
+        return slot;
+    };
+    for property_name in ["split_direction", "size"] {
+        if let Some(value) = node.get(property_name) {
+            property(&mut slot, property_name, value.clone());
+        }
+    }
+    let mut slot_children = KdlDocument::new();
+    for child in children.nodes() {
+        if child.name().value() == "pane" {
+            slot_children.nodes_mut().push(bare_slots(child));
+        }
+    }
+    slot.set_children(slot_children);
+    slot
+}
+
+fn bare_content_container(content: &[KdlNode], split_direction: Option<KdlValue>) -> KdlNode {
+    let mut slots: Vec<KdlNode> = content.iter().map(bare_slots).collect();
+    if slots.len() == 1 {
+        let mut node = slots.remove(0);
+        remove_property(&mut node, "size");
+        return node;
+    }
+    let mut container = KdlNode::new("pane");
+    if let Some(direction) = split_direction {
+        property(&mut container, "split_direction", direction);
+    }
+    let mut children = KdlDocument::new();
+    children.nodes_mut().append(&mut slots);
+    container.set_children(children);
+    container
+}
+
 fn content_container(
     mut content: Vec<KdlNode>,
     split_direction: Option<KdlValue>,
@@ -403,16 +466,26 @@ fn layout_with_sidebar(
             SidebarPosition::Top => "horizontal",
         },
     );
-    let mut wrapper_children = KdlDocument::new();
-    wrapper_children
+    let sidebar = sidebar_pane(size, executable, cwd);
+    let mut swap_wrapper = wrapper.clone();
+    let mut swap_wrapper_children = KdlDocument::new();
+    swap_wrapper_children.nodes_mut().push(sidebar.clone());
+    swap_wrapper_children
         .nodes_mut()
-        .push(sidebar_pane(size, executable, cwd));
+        .push(bare_content_container(&content, original_direction.clone()));
+    swap_wrapper.set_children(swap_wrapper_children);
+    let has_command_panes =
+        content.iter().any(has_command_pane) && content.iter().map(leaf_count).sum::<usize>() > 2;
+
+    let mut wrapper_children = KdlDocument::new();
+    wrapper_children.nodes_mut().push(sidebar);
     wrapper_children
         .nodes_mut()
         .push(content_container(content, original_direction, retained));
     wrapper.set_children(wrapper_children);
 
     let mut replacement_children = KdlDocument::new();
+    let mut swap_children = KdlDocument::new();
     let mut inserted = false;
     for mut node in original_children {
         if node.name().value() == "floating_panes" {
@@ -438,11 +511,13 @@ fn layout_with_sidebar(
             {
                 property(plugin, "location", alias);
             }
+            swap_children.nodes_mut().push(node.clone());
             replacement_children.nodes_mut().push(node);
         } else if node.name().value() != "pane" {
             replacement_children.nodes_mut().push(node);
         } else if !inserted {
             replacement_children.nodes_mut().push(wrapper.clone());
+            swap_children.nodes_mut().push(swap_wrapper.clone());
             inserted = true;
         }
     }
@@ -451,6 +526,18 @@ fn layout_with_sidebar(
     let mut root = KdlNode::new("layout");
     let mut root_children = KdlDocument::new();
     root_children.nodes_mut().push(tab);
+    if has_command_panes {
+        // Retained command panes cannot be matched to slots, so Zellij appends them wherever it
+        // finds room. Its swap-layout pass re-seats every retained pane into bare slots instead.
+        let mut swap_tab = KdlNode::new("tab");
+        swap_tab.set_children(swap_children);
+        let mut swap_layout = KdlNode::new("swap_tiled_layout");
+        property(&mut swap_layout, "name", SIDEBAR_PANE_NAME);
+        let mut swap_layout_children = KdlDocument::new();
+        swap_layout_children.nodes_mut().push(swap_tab);
+        swap_layout.set_children(swap_layout_children);
+        root_children.nodes_mut().push(swap_layout);
+    }
     root.set_children(root_children);
     let mut output = KdlDocument::new();
     output.nodes_mut().push(root);
