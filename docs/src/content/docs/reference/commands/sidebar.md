@@ -153,7 +153,9 @@ pane in every tab. New tabs are detected within about two seconds. Zellij
 sidebars are applied with `override-layout`, retaining running terminal panes
 and wrapping the complete nested content tree. workmux also restores the
 visible pane ordering when Zellij's logical pane order differs from its layout
-order. Zellij restores the remaining layout when sidebars close, so workmux
+order, including when enabled after multiple `workmux add` commands. Temporary
+layout slots are removed without closing the original running panes. Zellij
+restores the remaining layout when sidebars close, so workmux
 does not install hooks or run custom layout reflow.
 
 ### Session-scoped mode

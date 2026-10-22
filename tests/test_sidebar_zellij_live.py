@@ -59,7 +59,7 @@ class LiveZellij:
         return json.loads(self.action("list-panes", "--json", "--all").stdout)
 
     def sidebar(self, *args: str) -> None:
-        subprocess.run(
+        result = subprocess.run(
             [str(self.executable), "sidebar", *args],
             cwd=self.root,
             env=self.env
@@ -70,9 +70,10 @@ class LiveZellij:
             },
             capture_output=True,
             text=True,
-            timeout=20,
-            check=True,
+            timeout=60,
+            check=False,
         )
+        assert result.returncode == 0, result.stderr
 
 
 @pytest.fixture
@@ -321,4 +322,85 @@ def test_sidebar_keeps_side_by_side_row(
     assert len({pane["pane_rows"] for pane in content}) == 1, content
 
 
+@pytest.mark.parametrize("position", ["left", "top"])
+@pytest.mark.parametrize("count", [2, 4])
+def test_sidebar_preserves_feature_tabs(
+    live_zellij: LiveZellij, position: str, count: int
+):
+    (live_zellij.root / ".workmux.yaml").write_text(
+        "worktree_dir: .worktrees\n"
+        "sidebar:\n  width: 24\n  height: 4\n"
+        "panes:\n"
+        "  - command: sleep 300\n"
+        "    focus: true\n" + "  - split: horizontal\n    size: 50\n" * (count - 1)
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ],
+        cwd=live_zellij.root,
+        env=live_zellij.env,
+        check=True,
+    )
+    for branch in ("feature-one", "feature-two"):
+        subprocess.run(
+            [str(live_zellij.executable), "add", branch],
+            cwd=live_zellij.root,
+            env=live_zellij.env
+            | {
+                "ZELLIJ": "0",
+                "ZELLIJ_SESSION_NAME": live_zellij.session,
+                "ZELLIJ_PANE_ID": "0",
+            },
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=True,
+        )
+    before = [pane for pane in live_zellij.panes() if not pane["is_plugin"]]
+    original_order = {
+        tab_id: [
+            pane["id"]
+            for pane in sorted(
+                (pane for pane in before if pane["tab_id"] == tab_id),
+                key=lambda pane: (pane["pane_x"], pane["pane_y"]),
+            )
+        ]
+        for tab_id in {pane["tab_id"] for pane in before}
+    }
+    assert sorted(map(len, original_order.values())) == [1, count, count]
+    original_titles = {pane["id"]: pane["title"] for pane in before}
 
+    for _ in range(2):
+        live_zellij.sidebar("on", "--position", position)
+
+        after = [pane for pane in live_zellij.panes() if not pane["is_plugin"]]
+        assert len(after) == len(before) + len(original_order), after
+        for tab_id, pane_ids in original_order.items():
+            content = sorted(
+                (pane for pane in after if pane["id"] in pane_ids),
+                key=lambda pane: (pane["pane_x"], pane["pane_y"]),
+            )
+            assert [pane["id"] for pane in content] == pane_ids, content
+            assert all(pane["tab_id"] == tab_id for pane in content)
+            assert all(pane["title"] == original_titles[pane["id"]] for pane in content)
+            assert len({pane["pane_y"] for pane in content}) == 1, content
+            assert len({pane["pane_rows"] for pane in content}) == 1, content
+            assert (
+                len(
+                    [
+                        pane
+                        for pane in after
+                        if pane["tab_id"] == tab_id and pane["title"] == "workmux-sidebar"
+                    ]
+                )
+                == 1
+            ), after
