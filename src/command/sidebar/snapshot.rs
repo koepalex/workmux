@@ -463,6 +463,7 @@ mod tests {
             window_cmd: None,
             agent_command: None,
             agent_kind: None,
+            prompt: None,
         }
     }
 
@@ -475,6 +476,7 @@ mod tests {
             checks: None,
             check_meta: None,
             url: None,
+            closing_issues: Vec::new(),
         }
     }
 
@@ -814,6 +816,33 @@ mod tests {
         let restored: SidebarSnapshot = serde_json::from_value(json).unwrap();
         assert_eq!(restored.group_by, None);
         assert_eq!(restored.stale_threshold_secs, STALE_THRESHOLD_SECS);
+    }
+
+    #[test]
+    fn grouped_completion_stays_visible_and_numbered_until_acknowledged() {
+        let mut done = agent("/tmp/api__worktrees/done");
+        done.status = Some(AgentStatus::Done);
+        done.activity_ts = Some(1);
+        done.status_ts = Some(1);
+
+        let snapshot = build_snapshot(SnapshotInputs {
+            agents: vec![done.clone()],
+            group_by: Some(SidebarGroupBy::Project),
+            collapse_stale: true,
+            ..Default::default()
+        });
+        assert!(!snapshot.stale_pane_ids.contains(&done.pane_id));
+        assert!(is_jump_target(&snapshot, &done));
+
+        done.status = None;
+        let snapshot = build_snapshot(SnapshotInputs {
+            agents: vec![done.clone()],
+            group_by: Some(SidebarGroupBy::Project),
+            collapse_stale: true,
+            ..Default::default()
+        });
+        assert!(snapshot.stale_pane_ids.contains(&done.pane_id));
+        assert!(!is_jump_target(&snapshot, &done));
     }
 
     #[test]

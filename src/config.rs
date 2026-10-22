@@ -199,9 +199,54 @@ pub struct AutoNameConfig {
     pub background: Option<bool>,
 }
 
+/// Key reserved for leaving dashboard input mode.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum InputExitKey {
+    #[default]
+    Escape,
+    Ctrl(char),
+}
+
+impl TryFrom<String> for InputExitKey {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let value = value.to_ascii_lowercase();
+        if value == "esc" {
+            return Ok(Self::Escape);
+        }
+        if let Some(letter) = value.strip_prefix("ctrl+")
+            && letter.len() == 1
+            && letter.as_bytes()[0].is_ascii_lowercase()
+        {
+            return Ok(Self::Ctrl(letter.as_bytes()[0] as char));
+        }
+        Err("input_exit_key must be Esc or Ctrl+<letter> (a-z)".into())
+    }
+}
+
+impl From<InputExitKey> for String {
+    fn from(key: InputExitKey) -> Self {
+        match key {
+            InputExitKey::Escape => "Esc".into(),
+            InputExitKey::Ctrl(letter) => format!("Ctrl+{letter}"),
+        }
+    }
+}
+
+impl fmt::Display for InputExitKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&String::from(*self))
+    }
+}
+
 /// Configuration for dashboard actions (commit, merge keybindings)
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct DashboardConfig {
+    /// Key that exits input mode. Default: Esc.
+    pub input_exit_key: Option<InputExitKey>,
+
     /// Text to send to agent for commit action (c key).
     /// Default: "Commit staged changes with a descriptive message"
     pub commit: Option<String>,
@@ -210,7 +255,10 @@ pub struct DashboardConfig {
     /// Default: "!workmux merge"
     pub merge: Option<String>,
 
-    /// Size of the preview pane as a percentage of terminal height (1-90).
+    /// Dashboard arrangement: stacked (default) or side_by_side.
+    pub layout: Option<DashboardLayout>,
+
+    /// Size of the preview pane as a percentage of content height or width (10-90).
     /// Default: 60 (60% for preview, 40% for table)
     pub preview_size: Option<u8>,
 
@@ -238,9 +286,20 @@ pub struct DashboardConfig {
     pub close_on_jump: Option<bool>,
 }
 
+/// Arrangement of the dashboard table and preview.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DashboardLayout {
+    /// Table above the preview.
+    #[default]
+    Stacked,
+    /// Preview on the left, table on the right.
+    SideBySide,
+}
+
 /// A configurable column of the dashboard agents table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum AgentColumn {
     /// Jump key of the row, shown under the `#` header.
     Number,
@@ -253,6 +312,10 @@ pub enum AgentColumn {
     /// Pull request and check status. Rendered only while at least one agent
     /// has GitHub status to show.
     Pr,
+    /// Pull request title.
+    PrTitle,
+    /// Issues GitHub reports as closed by the pull request.
+    PrIssues,
     /// Multiplexer window index, as shown in the tmux status bar.
     Window,
     /// Agent status (icons).
@@ -261,6 +324,8 @@ pub enum AgentColumn {
     Time,
     /// Agent pane title.
     Title,
+    /// Latest prompt the user sent to the agent.
+    Prompt,
 }
 
 /// Columns used when the config does not set `dashboard.agent_columns`.
@@ -277,13 +342,15 @@ pub const DEFAULT_AGENT_COLUMNS: [AgentColumn; 8] = [
 
 /// A configurable column of the dashboard worktree table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum WorktreeColumn {
     Number,
     Project,
     Worktree,
     Git,
     Pr,
+    PrTitle,
+    PrIssues,
     Mux,
     Age,
     Agent,
@@ -316,6 +383,10 @@ fn columns_or_default<T: Copy + PartialEq>(configured: Option<&[T]>, defaults: &
 }
 
 impl DashboardConfig {
+    pub fn input_exit_key(&self) -> InputExitKey {
+        self.input_exit_key.unwrap_or_default()
+    }
+
     pub fn commit(&self) -> &str {
         self.commit
             .as_deref()
@@ -452,6 +523,17 @@ impl HorizontalSidebarConfig {
     }
 }
 
+/// Action performed by Enter on a sidebar agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarEnterAction {
+    /// Switch to and focus the agent pane.
+    #[default]
+    Focus,
+    /// Show the agent's window while keeping focus in its sidebar.
+    Select,
+}
+
 /// Configuration for the sidebar.
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct SidebarConfig {
@@ -470,6 +552,10 @@ pub struct SidebarConfig {
 
     /// Layout mode: "compact" or "tiles". Default: "tiles"
     pub layout: Option<String>,
+
+    /// Action performed by Enter on an agent: "focus" or "select".
+    /// Default: "focus".
+    pub enter_action: Option<SidebarEnterAction>,
 
     /// Horizontal bar configuration.
     #[serde(default)]
@@ -503,6 +589,10 @@ pub struct SidebarConfig {
 }
 
 impl SidebarConfig {
+    pub fn enter_action(&self) -> SidebarEnterAction {
+        self.enter_action.unwrap_or_default()
+    }
+
     pub fn git_status(&self) -> bool {
         self.git_status.unwrap_or(true)
     }
@@ -2354,72 +2444,113 @@ pub struct ConfigLocation {
 /// Find the nearest .workmux.yaml by walking up from start_dir to repo root.
 /// Returns ConfigLocation with the relative path computed at discovery time.
 pub fn find_project_config(start_dir: &Path) -> anyhow::Result<Option<ConfigLocation>> {
+    match discover_project_config(start_dir) {
+        Ok(discovery) => Ok(discovery.location),
+        Err(error) => {
+            debug!(%error, "config:project discovery failed");
+            Ok(None)
+        }
+    }
+}
+
+/// A successful observation includes repository identity even when no config exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectConfigDiscovery {
+    pub location: Option<ConfigLocation>,
+    repository: Option<git::RepositoryIdentity>,
+    main_root: Option<PathBuf>,
+    repository_stamps: Vec<(u64, u64)>,
+    config_stamp: Option<(u64, u64, u64, i64, i64, i64, i64)>,
+}
+
+impl ProjectConfigDiscovery {
+    fn with_location(mut self, location: ConfigLocation) -> anyhow::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&location.config_path)?;
+        self.config_stamp = Some((
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ));
+        self.location = Some(location);
+        Ok(self)
+    }
+}
+
+/// Discover without converting failed probes into confirmed absence.
+pub(crate) fn discover_project_config(start_dir: &Path) -> anyhow::Result<ProjectConfigDiscovery> {
     let config_names = [".workmux.yaml", ".workmux.yml"];
-
-    let repo_root = match git::get_repo_root_for(start_dir) {
-        Ok(root) => root,
-        Err(_) => return Ok(None),
+    let mut discovery = ProjectConfigDiscovery {
+        location: None,
+        repository: None,
+        main_root: None,
+        repository_stamps: Vec::new(),
+        config_stamp: None,
     };
+    let Some(repo_root) = git::worktree_root_if_present(start_dir)? else {
+        return Ok(discovery);
+    };
+    let repo_root = repo_root.canonicalize()?;
+    let mut dir = start_dir.canonicalize()?;
+    let repository = git::RepositoryIdentity::discover(&repo_root)?;
+    let linked = repository.admin_dir != repository.common_dir;
+    use std::os::unix::fs::MetadataExt;
+    for path in [
+        &repository.worktree,
+        &repository.dot_git,
+        &repository.admin_dir,
+        &repository.common_dir,
+    ] {
+        let metadata = std::fs::metadata(path)?;
+        discovery
+            .repository_stamps
+            .push((metadata.dev(), metadata.ino()));
+    }
+    discovery.repository = Some(repository);
 
-    // Canonicalize both paths to handle symlinks and ensure consistent comparison
-    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
-    let mut dir = start_dir
-        .canonicalize()
-        .unwrap_or_else(|_| start_dir.to_path_buf());
-
-    // Safety: ensure we're inside the repo
     if !dir.starts_with(&repo_root) {
-        return Ok(None);
+        return Ok(discovery);
     }
 
-    // Walk upward from start_dir to repo_root (inclusive)
     loop {
         for name in &config_names {
             let candidate = dir.join(name);
-            if candidate.exists() {
-                let rel_dir = dir
-                    .strip_prefix(&repo_root)
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_default();
-                debug!(
-                    path = %candidate.display(),
-                    rel_dir = %rel_dir.display(),
-                    "config:found project config"
-                );
-                return Ok(Some(ConfigLocation {
+            if candidate.try_exists()? {
+                let rel_dir = dir.strip_prefix(&repo_root)?.to_path_buf();
+                return discovery.with_location(ConfigLocation {
                     config_path: candidate,
                     config_dir: dir,
                     rel_dir,
-                }));
+                });
             }
         }
-        if dir == repo_root {
-            break;
-        }
-        if !dir.pop() {
+        if dir == repo_root || !dir.pop() {
             break;
         }
     }
 
-    // Fallback: check main worktree root (preserves existing behavior for linked worktrees)
-    if let Ok(main_root) = git::get_main_worktree_root() {
-        let main_root = main_root.canonicalize().unwrap_or(main_root);
+    // A regular main worktree cannot fall back to a different main worktree.
+    if linked {
+        let main_root = git::get_main_worktree_root_in(Some(&repo_root))?.canonicalize()?;
+        discovery.main_root = Some(main_root.clone());
         if main_root != repo_root {
             for name in &config_names {
                 let candidate = main_root.join(name);
-                if candidate.exists() {
-                    debug!(path = %candidate.display(), "config:found main-worktree config");
-                    return Ok(Some(ConfigLocation {
+                if candidate.try_exists()? {
+                    return discovery.with_location(ConfigLocation {
                         config_path: candidate,
-                        config_dir: main_root.clone(),
-                        rel_dir: PathBuf::new(), // Main worktree root = empty rel_dir
-                    }));
+                        config_dir: main_root,
+                        rel_dir: PathBuf::new(),
+                    });
                 }
             }
         }
     }
-
-    Ok(None)
+    Ok(discovery)
 }
 
 impl WorktreeNaming {
@@ -2630,6 +2761,19 @@ fn merge_grouped_templates(
 }
 
 impl Config {
+    /// Whether status hooks store the latest user prompt. Prompts are kept
+    /// only while the dashboard or sidebar is configured to show them.
+    pub fn prompt_capture_enabled(&self) -> bool {
+        self.dashboard
+            .agent_columns()
+            .contains(&AgentColumn::Prompt)
+            || self
+                .sidebar
+                .templates
+                .as_ref()
+                .is_some_and(crate::command::sidebar::templates_use_prompt)
+    }
+
     /// Load and merge global and project configurations.
     pub fn load(cli_agent: Option<&str>) -> anyhow::Result<Self> {
         Self::load_with_override(cli_agent, None)
@@ -3045,8 +3189,13 @@ impl Config {
 
         // Dashboard actions: per-field override
         merged.dashboard = DashboardConfig {
+            input_exit_key: project
+                .dashboard
+                .input_exit_key
+                .or(self.dashboard.input_exit_key),
             commit: project.dashboard.commit.or(self.dashboard.commit),
             merge: project.dashboard.merge.or(self.dashboard.merge),
+            layout: project.dashboard.layout.or(self.dashboard.layout),
             preview_size: project
                 .dashboard
                 .preview_size
@@ -3076,6 +3225,7 @@ impl Config {
             width: project.sidebar.width.or(self.sidebar.width),
             height: project.sidebar.height.or(self.sidebar.height),
             layout: project.sidebar.layout.or(self.sidebar.layout),
+            enter_action: project.sidebar.enter_action.or(self.sidebar.enter_action),
             horizontal: HorizontalSidebarConfig {
                 item_width: project
                     .sidebar
@@ -3595,11 +3745,13 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 # dashboard:
 #   commit: "Commit staged changes with a descriptive message"
 #   merge: "!workmux merge"
+#   layout: stacked # or side_by_side (preview left, table right)
 #   preview_size: 60
 #   agent_columns: [number, project, worktree, git, pr, status, time, title]
 #   worktree_columns: [number, project, worktree, git, pr, mux, age, agent]
 #   sort_mode: priority
 #   close_on_jump: true
+#   input_exit_key: Esc # Esc or Ctrl+<letter> (a-z)
 
 #-------------------------------------------------------------------------------
 # Sidebar
@@ -3621,6 +3773,10 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 #   # Layout mode for the left sidebar: "compact" or "tiles" (cards).
 #   # Default: "tiles". Can be toggled at runtime with 'v' key.
 #   layout: tiles
+#
+#   # Enter action: "focus" (default) focuses the agent pane; "select" shows
+#   # its window while keeping focus in the sidebar. Press 'o' to focus the pane.
+#   enter_action: focus
 #
 #   # Row ordering: "recency" (default), "priority" or "window".
 #   sort: recency
@@ -3790,12 +3946,14 @@ mod tests {
     use super::{
         AgentColumn, AgentEnvValue, AgentIconConfig, AgentIconDetails, AllowedDomainDetails,
         AllowedDomainEntry, CLEANUP_NODE_MODULES_PLACEHOLDER, Config, ContainerConfig,
-        ContainerDevice, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS, ExtraMount, FileConfig,
-        LayoutConfig, LimaConfig, NODE_MODULES_CLEANUP_SCRIPT, NetworkConfig, NetworkPolicy,
-        PaneConfig, SandboxConfig, SandboxRuntime, SandboxTarget, SidebarHeight, SidebarPosition,
-        SidebarWidth, SplitDirection, ToolchainMode, WindowPlacement, WorktreeColumn,
-        is_agent_command, validate_domain, validate_group_add_entry, validate_layouts_config,
+        ContainerDevice, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS, DashboardLayout,
+        ExtraMount, FileConfig, LayoutConfig, LimaConfig, NODE_MODULES_CLEANUP_SCRIPT,
+        NetworkConfig, NetworkPolicy, PaneConfig, SandboxConfig, SandboxRuntime, SandboxTarget,
+        SidebarEnterAction, SidebarHeight, SidebarPosition, SidebarWidth, SplitDirection,
+        ToolchainMode, WindowPlacement, WorktreeColumn, is_agent_command, validate_domain,
+        validate_group_add_entry, validate_layouts_config,
     };
+    use super::{DashboardConfig, InputExitKey};
     use crate::test_support;
     use tempfile::TempDir;
 
@@ -3848,6 +4006,89 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_input_exit_key_defaults_to_escape() {
+        assert_eq!(
+            Config::default().dashboard.input_exit_key(),
+            InputExitKey::Escape
+        );
+    }
+
+    #[test]
+    fn dashboard_input_exit_key_parses_and_round_trips() {
+        for (value, expected) in [
+            ("Esc", InputExitKey::Escape),
+            ("esc", InputExitKey::Escape),
+            ("Ctrl+q", InputExitKey::Ctrl('q')),
+            ("CTRL+Z", InputExitKey::Ctrl('z')),
+        ] {
+            let config: Config =
+                serde_yaml::from_str(&format!("dashboard:\n  input_exit_key: {value}\n")).unwrap();
+            assert_eq!(config.dashboard.input_exit_key(), expected);
+            let serialized = serde_yaml::to_string(&config.dashboard).unwrap();
+            let round_trip: DashboardConfig = serde_yaml::from_str(&serialized).unwrap();
+            assert_eq!(round_trip.input_exit_key(), expected);
+        }
+    }
+
+    #[test]
+    fn dashboard_input_exit_key_rejects_invalid_values() {
+        for value in ["", "q", "Ctrl+", "Ctrl+qq", "Ctrl+1", "Alt+q", "Ctrl+é"] {
+            let error = serde_yaml::from_str::<Config>(&format!(
+                "dashboard:\n  input_exit_key: '{value}'\n"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("input_exit_key must be"));
+        }
+    }
+
+    #[test]
+    fn dashboard_input_exit_key_inherits_and_overrides_global() {
+        let global: Config =
+            serde_yaml::from_str("dashboard:\n  input_exit_key: Ctrl+q\n").unwrap();
+        assert_eq!(
+            global
+                .clone()
+                .merge(Config::default())
+                .dashboard
+                .input_exit_key(),
+            InputExitKey::Ctrl('q')
+        );
+        let project: Config = serde_yaml::from_str("dashboard:\n  input_exit_key: Esc\n").unwrap();
+        assert_eq!(
+            global.merge(project).dashboard.input_exit_key(),
+            InputExitKey::Escape
+        );
+    }
+
+    #[test]
+    fn dashboard_layout_defaults_to_stacked() {
+        assert_eq!(
+            Config::default().dashboard.layout.unwrap_or_default(),
+            DashboardLayout::Stacked
+        );
+    }
+
+    #[test]
+    fn dashboard_layout_parses_and_merges() {
+        let global: Config = serde_yaml::from_str("dashboard:\n  layout: side_by_side\n").unwrap();
+        assert_eq!(
+            global.clone().merge(Config::default()).dashboard.layout,
+            Some(DashboardLayout::SideBySide)
+        );
+        let project: Config = serde_yaml::from_str("dashboard:\n  layout: stacked\n").unwrap();
+        assert_eq!(
+            global.merge(project).dashboard.layout,
+            Some(DashboardLayout::Stacked)
+        );
+        let project: Config = serde_yaml::from_str("dashboard:\n  layout: side_by_side\n").unwrap();
+        assert_eq!(
+            Config::default().merge(project).dashboard.layout,
+            Some(DashboardLayout::SideBySide)
+        );
+        assert!(serde_yaml::from_str::<Config>("dashboard:\n  layout: sideways\n").is_err());
+    }
+
+    #[test]
     fn dashboard_closes_on_jump_by_default() {
         assert!(Config::default().dashboard.close_on_jump());
     }
@@ -3896,13 +4137,15 @@ mod tests {
     #[test]
     fn agent_columns_follow_configured_order() {
         let config: Config = serde_yaml::from_str(
-            "dashboard:\n  agent_columns: [title, status, number, worktree, git, pr, window, project, time]\n",
+            "dashboard:\n  agent_columns: [title, pr_title, pr_issues, status, number, worktree, git, pr, window, project, time]\n",
         )
         .expect("config parses");
         assert_eq!(
             config.dashboard.agent_columns(),
             vec![
                 AgentColumn::Title,
+                AgentColumn::PrTitle,
+                AgentColumn::PrIssues,
                 AgentColumn::Status,
                 AgentColumn::Number,
                 AgentColumn::Worktree,
@@ -3947,6 +4190,43 @@ mod tests {
     }
 
     #[test]
+    fn prompt_capture_follows_prompt_display() {
+        let enabled = |yaml: &str| {
+            serde_yaml::from_str::<Config>(yaml)
+                .expect("config parses")
+                .prompt_capture_enabled()
+        };
+
+        assert!(!Config::default().prompt_capture_enabled());
+        assert!(enabled("dashboard:\n  agent_columns: [title, prompt]\n"));
+        assert!(!enabled("dashboard:\n  agent_columns: [title]\n"));
+        assert!(enabled(
+            "sidebar:\n  templates:\n    compact: '{primary} {prompt}'\n"
+        ));
+        assert!(enabled(
+            "sidebar:\n  templates:\n    horizontal: ['{primary}', '{prompt}']\n"
+        ));
+        assert!(enabled(
+            "sidebar:\n  templates:\n    grouped:\n      tiles: ['{primary}', '{prompt}']\n"
+        ));
+        assert!(enabled(
+            "sidebar:\n  templates:\n    grouped:\n      compact: '{prompt}'\n"
+        ));
+        // Escaped braces render literal text.
+        assert!(!enabled(
+            "sidebar:\n  templates:\n    compact: '{{prompt}}'\n"
+        ));
+        // Group headers cannot render agent tokens.
+        assert!(!enabled(
+            "sidebar:\n  templates:\n    grouped:\n      header: '{group} {prompt}'\n"
+        ));
+        // An invalid line makes the sidebar fall back to the default tiles.
+        assert!(!enabled(
+            "sidebar:\n  templates:\n    tiles: ['{prompt}', '{unclosed']\n"
+        ));
+    }
+
+    #[test]
     fn agent_columns_inherit_global_when_project_unset() {
         let global: Config = serde_yaml::from_str("dashboard:\n  agent_columns: [status, title]\n")
             .expect("config parses");
@@ -3977,13 +4257,15 @@ mod tests {
     #[test]
     fn worktree_columns_follow_configured_order() {
         let config: Config = serde_yaml::from_str(
-            "dashboard:\n  worktree_columns: [agent, mux, number, worktree, git, pr, project, age]\n",
+            "dashboard:\n  worktree_columns: [agent, pr_title, pr_issues, mux, number, worktree, git, pr, project, age]\n",
         )
         .expect("config parses");
         assert_eq!(
             config.dashboard.worktree_columns(),
             vec![
                 WorktreeColumn::Agent,
+                WorktreeColumn::PrTitle,
+                WorktreeColumn::PrIssues,
                 WorktreeColumn::Mux,
                 WorktreeColumn::Number,
                 WorktreeColumn::Worktree,
@@ -4688,6 +4970,33 @@ sidebar:
     }
 
     #[test]
+    fn sidebar_enter_action_defaults_parses_and_merges() {
+        assert_eq!(
+            Config::default().sidebar.enter_action(),
+            SidebarEnterAction::Focus
+        );
+
+        let global: Config = serde_yaml::from_str("sidebar:\n  enter_action: select\n").unwrap();
+        assert_eq!(global.sidebar.enter_action(), SidebarEnterAction::Select);
+        assert_eq!(
+            global
+                .clone()
+                .merge(Config::default())
+                .sidebar
+                .enter_action(),
+            SidebarEnterAction::Select
+        );
+
+        let project: Config = serde_yaml::from_str("sidebar:\n  enter_action: focus\n").unwrap();
+        assert_eq!(
+            global.merge(project).sidebar.enter_action(),
+            SidebarEnterAction::Focus
+        );
+
+        assert!(serde_yaml::from_str::<Config>("sidebar:\n  enter_action: preview\n").is_err());
+    }
+
+    #[test]
     fn sidebar_position_and_height_merge_per_field() {
         let global: Config = serde_yaml::from_str(
             r#"
@@ -4983,6 +5292,92 @@ agents:
 
     use super::find_project_config;
     use std::fs;
+
+    #[test]
+    fn project_discovery_repository_fallback_is_isolated() {
+        const TEST: &str = "config::tests::project_discovery_repository_fallback_is_isolated";
+        if !crate::test_support::is_isolated_child(TEST) {
+            let cwd = git_tempdir();
+            fs::write(cwd.path().join(".workmux.yaml"), "agent: unrelated").unwrap();
+            crate::test_support::run_isolated_test(TEST, cwd.path(), &[]);
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        crate::test_support::init_repo(repo.path());
+        assert!(
+            super::discover_project_config(repo.path())
+                .unwrap()
+                .location
+                .is_none()
+        );
+        let outside = tempfile::tempdir().unwrap();
+        assert!(
+            super::discover_project_config(outside.path())
+                .unwrap()
+                .location
+                .is_none()
+        );
+        let linked = outside.path().join("linked");
+        crate::test_support::run_git(
+            repo.path(),
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        fs::write(repo.path().join(".workmux.yml"), "agent: main").unwrap();
+        let fallback = find_project_config(&linked).unwrap().unwrap();
+        assert_eq!(fallback.config_dir, repo.path().canonicalize().unwrap());
+        assert!(fallback.rel_dir.as_os_str().is_empty());
+        fs::write(linked.join(".workmux.yaml"), "agent: linked").unwrap();
+        assert_eq!(
+            find_project_config(&linked).unwrap().unwrap().config_dir,
+            linked.canonicalize().unwrap()
+        );
+        fs::remove_file(linked.join(".workmux.yaml")).unwrap();
+        fs::remove_file(repo.path().join(".workmux.yml")).unwrap();
+        assert!(find_project_config(&linked).unwrap().is_none());
+        println!("{}", crate::test_support::ISOLATED_TEST_CANARY);
+    }
+
+    #[test]
+    fn project_discovery_distinguishes_errors_and_preserves_public_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join(".git"),
+            "gitdir: /missing/workmux-test-gitdir",
+        )
+        .unwrap();
+        assert!(super::discover_project_config(temp.path()).is_err());
+        assert!(find_project_config(temp.path()).unwrap().is_none());
+        fs::remove_file(temp.path().join(".git")).unwrap();
+        assert!(
+            super::discover_project_config(temp.path())
+                .unwrap()
+                .location
+                .is_none()
+        );
+        crate::test_support::init_repo(temp.path());
+        std::os::unix::fs::symlink(".workmux.yaml", temp.path().join(".workmux.yaml")).unwrap();
+        assert!(super::discover_project_config(temp.path()).is_err());
+        fs::remove_file(temp.path().join(".workmux.yaml")).unwrap();
+        fs::write(temp.path().join(".workmux.yaml"), "agent: recovered").unwrap();
+        assert!(
+            super::discover_project_config(temp.path())
+                .unwrap()
+                .location
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn project_discovery_git_spawn_failure_is_not_absence() {
+        const TEST: &str = "config::tests::project_discovery_git_spawn_failure_is_not_absence";
+        if !crate::test_support::is_isolated_child(TEST) {
+            let temp = tempfile::tempdir().unwrap();
+            crate::test_support::run_isolated_test(TEST, temp.path(), &[("PATH", temp.path())]);
+            return;
+        }
+        assert!(super::discover_project_config(&std::env::current_dir().unwrap()).is_err());
+        println!("{}", crate::test_support::ISOLATED_TEST_CANARY);
+    }
 
     #[test]
     fn find_project_config_from_subdir() {

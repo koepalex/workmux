@@ -520,7 +520,7 @@ impl App {
 
     /// Get PR info for an agent by looking up its branch in PR statuses
     pub fn get_pr_for_agent(&self, agent: &AgentPane) -> Option<&PrSummary> {
-        let repo_root = self.repo_roots.get(&agent.path)?;
+        let repo_root = self.repo_keys.get(&agent.path)?;
         let git_status = self.git_statuses.get(&agent.path)?;
         let branch = git_status.branch.as_ref()?;
         // Don't show PRs for main/master - you merge INTO main, not FROM it
@@ -531,7 +531,7 @@ impl App {
     }
 
     pub fn get_checks_for_agent(&self, agent: &AgentPane) -> Option<&CheckSummary> {
-        let repo_root = self.repo_roots.get(&agent.path)?;
+        let repo_root = self.repo_keys.get(&agent.path)?;
         let branch = self.git_statuses.get(&agent.path)?.branch.as_ref()?;
         self.check_statuses
             .get(repo_root)?
@@ -543,16 +543,8 @@ impl App {
         &self,
         worktree: &crate::workflow::types::WorktreeInfo,
     ) -> Option<&CheckSummary> {
-        let project = agent::extract_project_name(&worktree.path);
-        let repo_root = self
-            .all_worktrees
-            .iter()
-            .find(|candidate| {
-                candidate.is_main && agent::extract_project_name(&candidate.path) == project
-            })
-            .map(|candidate| &candidate.path)?;
         self.check_statuses
-            .get(repo_root)?
+            .get(&worktree.repo_key)?
             .get(&worktree.branch)
             .filter(|summary| summary.should_display_for_branch(&worktree.branch))
     }

@@ -77,6 +77,13 @@ pub fn render_worktree_table(f: &mut Frame, app: &mut App, area: Rect) {
             let git_status = app.git_statuses.get(&wt.path);
             let git_spans = format_git_status(git_status, app.spinner_frame, &app.palette);
 
+            let pr_title = wt
+                .pr_info
+                .as_ref()
+                .map(|pr| pr.title.clone())
+                .unwrap_or_default();
+            let pr_issues = format::format_pr_issues(wt.pr_info.as_ref());
+
             // PR status (only computed if column is shown)
             let pr_spans = if show_pr_column {
                 format_pr_status(
@@ -125,6 +132,8 @@ pub fn render_worktree_table(f: &mut Frame, app: &mut App, area: Rect) {
                 is_current,
                 git_spans,
                 pr_spans,
+                pr_title,
+                pr_issues,
                 agent_line: format::spans_to_line(agent_spans),
                 has_mux_window: wt.has_mux_window,
                 age: age.unwrap_or_default(),
@@ -156,6 +165,8 @@ struct WorktreeRowData {
     is_current: bool,
     git_spans: Vec<(String, Style)>,
     pr_spans: Vec<(String, Style)>,
+    pr_title: String,
+    pr_issues: String,
     agent_line: Line<'static>,
     has_mux_window: bool,
     age: String,
@@ -190,6 +201,8 @@ fn worktree_cell(
             .style(format::make_row_style(row.is_current, row.is_main, palette)),
         WorktreeColumn::Git => Cell::from(format::spans_to_line(row.git_spans.clone())),
         WorktreeColumn::Pr => Cell::from(format::spans_to_line(row.pr_spans.clone())),
+        WorktreeColumn::PrTitle => Cell::from(row.pr_title.clone()),
+        WorktreeColumn::PrIssues => Cell::from(row.pr_issues.clone()),
         WorktreeColumn::Mux => {
             if row.has_mux_window {
                 Cell::from("\u{25cf}").style(Style::default().fg(palette.success))
@@ -230,6 +243,8 @@ fn build_worktree_table(
             WorktreeColumn::Worktree => ResourceHeaderCell::Plain("Worktree"),
             WorktreeColumn::Git => ResourceHeaderCell::Git,
             WorktreeColumn::Pr => ResourceHeaderCell::Pr,
+            WorktreeColumn::PrTitle => ResourceHeaderCell::Plain("PR Title"),
+            WorktreeColumn::PrIssues => ResourceHeaderCell::Plain("PR Issues"),
             WorktreeColumn::Mux => ResourceHeaderCell::Plain("Mux"),
             WorktreeColumn::Age => ResourceHeaderCell::Plain("Age"),
             WorktreeColumn::Agent => ResourceHeaderCell::Plain("Agent"),
@@ -268,6 +283,10 @@ fn build_worktree_table(
         .unwrap_or(4)
         .clamp(4, 16)
         + 1;
+    let pr_titles: Vec<String> = row_data.iter().map(|row| row.pr_title.clone()).collect();
+    let max_pr_title_width = format::calc_column_width(&pr_titles, 8, 60, 1);
+    let pr_issues: Vec<String> = row_data.iter().map(|row| row.pr_issues.clone()).collect();
+    let max_pr_issues_width = format::calc_column_width(&pr_issues, 9, 40, 1);
     let max_agent_width = row_data
         .iter()
         .map(|row| row.agent_line.width())
@@ -285,6 +304,10 @@ fn build_worktree_table(
             WorktreeColumn::Worktree => Constraint::Length(max_worktree_width),
             WorktreeColumn::Git => Constraint::Length(max_git_width as u16),
             WorktreeColumn::Pr => Constraint::Length(max_pr_width as u16),
+            WorktreeColumn::PrTitle if index == last_column => Constraint::Fill(1),
+            WorktreeColumn::PrTitle => Constraint::Length(max_pr_title_width),
+            WorktreeColumn::PrIssues if index == last_column => Constraint::Fill(1),
+            WorktreeColumn::PrIssues => Constraint::Length(max_pr_issues_width),
             WorktreeColumn::Mux => Constraint::Length(4),
             WorktreeColumn::Age => Constraint::Length(4),
             // Fill only at the end, so columns after Agent stay contiguous.
@@ -623,6 +646,8 @@ mod tests {
             is_current: false,
             git_spans: vec![("+1".into(), Style::default())],
             pr_spans: vec![("#7".into(), Style::default())],
+            pr_title: "fix the dashboard".into(),
+            pr_issues: "#308 #270".into(),
             agent_line: Line::from("working"),
             has_mux_window: true,
             age: "2h".into(),
@@ -702,6 +727,14 @@ mod tests {
         let buffer = render(&[Worktree, Agent], vec![row()], 24, None);
         assert_eq!(line(&buffer, 0), "Worktree  Agent");
         assert_eq!(line(&buffer, 1), "wt        working");
+    }
+
+    #[test]
+    fn worktree_table_renders_opt_in_pr_metadata_without_pr_status() {
+        use WorktreeColumn::*;
+        let buffer = render(&[PrTitle, PrIssues], vec![row()], 60, None);
+        assert_eq!(line(&buffer, 0), "PR Title           PR Issues");
+        assert_eq!(line(&buffer, 1), "fix the dashboard  #308 #270");
     }
 
     #[test]
