@@ -228,6 +228,85 @@ fn pane_navigation(panes: &[PaneInfo], target_id: u32) -> Result<(u32, isize)> {
     Ok((tab_id, target_idx as isize - current_idx as isize))
 }
 
+const PANE_TABLE_HEADER: [&str; 13] = [
+    "TAB_ID", "TAB_POS", "TAB_NAME", "PANE_ID", "TYPE", "TITLE", "FOCUSED", "FLOATING", "EXITED",
+    "X", "Y", "ROWS", "COLS",
+];
+
+/// Parse `list-panes --geometry --state --tab` table output. Returns `None` for any
+/// unexpected shape so callers can fall back to the JSON query.
+fn parse_pane_table(output: &str, tabs: &[TabInfo]) -> Option<Vec<(u32, ZellijSidebarPane)>> {
+    let mut lines = output.lines();
+    let header: Vec<_> = lines.next()?.split_whitespace().collect();
+    if header != PANE_TABLE_HEADER {
+        return None;
+    }
+    let mut panes = Vec::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let mut spans = Vec::new();
+        let mut start = None;
+        for (index, character) in line.char_indices() {
+            match (character.is_whitespace(), start) {
+                (false, None) => start = Some(index),
+                (true, Some(begin)) => {
+                    spans.push((begin, index));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(begin) = start {
+            spans.push((begin, line.len()));
+        }
+        let token = |index: usize| &line[spans[index].0..spans[index].1];
+        let tab_id: u32 = token(0).parse().ok()?;
+        // Tab names may contain spaces; list-tabs tells us how many tokens to skip.
+        let pane_index = 2 + tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)?
+            .name
+            .split_whitespace()
+            .count();
+        let count = spans.len();
+        if count < pane_index + 2 + 7 {
+            return None;
+        }
+        match token(pane_index + 1) {
+            "plugin" => continue,
+            "terminal" => {}
+            _ => return None,
+        }
+        let pane_id = token(pane_index);
+        parse_pane_id(pane_id)?;
+        let title = if count > pane_index + 9 {
+            &line[spans[pane_index + 2].0..spans[count - 8].1]
+        } else {
+            ""
+        };
+        let flag = |index: usize| match token(index) {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        };
+        let number = |index: usize| token(index).parse::<u16>().ok();
+        panes.push((
+            tab_id,
+            ZellijSidebarPane {
+                pane_id: pane_id.to_string(),
+                title: title.to_string(),
+                command: None,
+                is_focused: flag(count - 7)?,
+                is_floating: flag(count - 6)?,
+                pane_x: Some(number(count - 4)?),
+                pane_y: Some(number(count - 3)?),
+                pane_rows: Some(number(count - 2)?),
+                pane_columns: Some(number(count - 1)?),
+            },
+        ));
+    }
+    Some(panes)
+}
+
 fn query_json_with_retry<T, F>(mut query: F, parse_context: &str, delay: Duration) -> Result<T>
 where
     T: DeserializeOwned,
@@ -626,29 +705,45 @@ impl ZellijBackend {
         Ok(self.sidebar_observation()?.tabs)
     }
 
-    pub(crate) fn sidebar_tab_panes(&self, tab_id: u32) -> Result<Vec<ZellijSidebarPane>> {
-        let panes: Vec<PaneInfo> = query_json_with_retry(
-            || {
-                self.command()
-                    .args(&[
-                        "action",
-                        "list-panes",
-                        "--json",
-                        "--geometry",
-                        "--state",
-                        "--tab",
-                    ])
-                    .run_and_capture_stdout()
-                    .context("Failed to list Zellij pane geometry")
-            },
-            "Failed to parse Zellij pane geometry",
-            Duration::from_millis(50),
-        )?;
-        Ok(panes
+    /// Pane titles, state, and geometry without commands or plugin aliases.
+    ///
+    /// JSON output makes Zellij resolve every pane's command and cwd, which costs
+    /// hundreds of milliseconds per call. The table form skips that work.
+    pub(crate) fn sidebar_layout_tabs(&self) -> Result<Vec<ZellijSidebarTab>> {
+        let output = self
+            .command()
+            .args(&["action", "list-panes", "--geometry", "--state", "--tab"])
+            .run_and_capture_stdout();
+        let tabs = self.list_tabs()?;
+        let Some(panes) = output
+            .ok()
+            .and_then(|output| parse_pane_table(&output, &tabs))
+        else {
+            return self.sidebar_tabs();
+        };
+        Ok(tabs
             .iter()
-            .filter(|pane| !pane.is_plugin && pane.tab_id == Some(tab_id))
-            .map(ZellijSidebarPane::from)
+            .map(|tab| ZellijSidebarTab {
+                tab_id: tab.tab_id,
+                position: tab.position,
+                active: tab.active,
+                ui_plugin_aliases: HashSet::new(),
+                panes: panes
+                    .iter()
+                    .filter(|(tab_id, _)| *tab_id == tab.tab_id)
+                    .map(|(_, pane)| pane.clone())
+                    .collect(),
+            })
             .collect())
+    }
+
+    pub(crate) fn sidebar_tab_panes(&self, tab_id: u32) -> Result<Vec<ZellijSidebarPane>> {
+        Ok(self
+            .sidebar_layout_tabs()?
+            .into_iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .map(|tab| tab.panes)
+            .unwrap_or_default())
     }
 
     pub(crate) fn close_pane_by_id(&self, pane_id: &str) -> Result<()> {
@@ -1589,6 +1684,35 @@ mod tests {
             find_created_terminal_pane_id(&before_ids, &panes, Some(7), None),
             None
         );
+    }
+
+    #[test]
+    fn pane_table_keeps_spaced_names_and_rejects_unknown_shapes() {
+        let tabs = [TabInfo {
+            tab_id: 4,
+            position: 1,
+            name: "wm feature one".to_string(),
+            active: true,
+        }];
+        let output = "TAB_ID  TAB_POS  TAB_NAME  PANE_ID  TYPE  TITLE  FOCUSED  FLOATING  EXITED  X  Y  ROWS  COLS\n\
+            4  1  wm feature one  plugin_0  plugin  tab-bar  false  false  false  0  0  1  80\n\
+            4  1  wm feature one  terminal_7  terminal  sleep  300  true  false  false  24  1  43  56\n";
+
+        let panes = parse_pane_table(output, &tabs).unwrap();
+        assert_eq!(panes.len(), 1);
+        let (tab_id, pane) = &panes[0];
+        assert_eq!(*tab_id, 4);
+        assert_eq!(pane.pane_id, "terminal_7");
+        assert_eq!(pane.title, "sleep  300");
+        assert!(pane.is_focused && !pane.is_floating);
+        assert_eq!(
+            (pane.pane_x, pane.pane_y, pane.pane_rows, pane.pane_columns),
+            (Some(24), Some(1), Some(43), Some(56))
+        );
+
+        assert!(parse_pane_table("[]", &tabs).is_none());
+        let unknown_tab = output.replace("\n4  1", "\n5  1");
+        assert!(parse_pane_table(&unknown_tab, &tabs).is_none());
     }
 
     #[test]

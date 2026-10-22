@@ -718,35 +718,52 @@ fn finish_sidebar_updates(instance_id: &str, updates: &[SidebarUpdate<'_>]) -> R
     }
     let mux = backend(instance_id);
     // Overrides acknowledge before spawning panes. Wait for every slot before cleanup.
-    // Each observation scans process trees, so share it across all changed tabs.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Snapshots come from the cheap pane table, which lacks commands. Use the full
+    // query only if a new pane cannot be identified by its title.
+    let started = std::time::Instant::now();
     let tabs = loop {
-        let tabs = mux.sidebar_tabs()?;
+        let cheap = started.elapsed() < std::time::Duration::from_secs(1);
+        let tabs = if cheap {
+            mux.sidebar_layout_tabs()?
+        } else {
+            mux.sidebar_tabs()?
+        };
         let mut pending = Vec::new();
+        let mut unidentified = false;
         for update in updates {
             let tab = tabs
                 .iter()
                 .find(|tab| tab.tab_id == update.tab.tab_id)
                 .ok_or_else(|| anyhow!("Zellij tab {} disappeared", update.tab.tab_id))?;
-            let slots = tab
-                .panes
-                .iter()
-                .filter(|pane| {
-                    pane.title == update.placeholder_name
-                        || pane
-                            .command
-                            .as_deref()
-                            .is_some_and(|command| command.contains(&update.placeholder_name))
-                })
-                .count();
-            if slots < update.slot_count {
+            let is_slot = |pane: &ZellijSidebarPane| {
+                pane.title == update.placeholder_name
+                    || pane
+                        .command
+                        .as_deref()
+                        .is_some_and(|command| command.contains(&update.placeholder_name))
+            };
+            if tab.panes.iter().filter(|pane| is_slot(pane)).count() < update.slot_count {
                 pending.push(tab.tab_id);
             }
+            unidentified |= cheap
+                && tab.panes.iter().any(|pane| {
+                    !is_slot(pane)
+                        && !is_sidebar_pane(&pane.title)
+                        && !update
+                            .tab
+                            .panes
+                            .iter()
+                            .any(|original| original.pane_id == pane.pane_id)
+                });
         }
         if pending.is_empty() {
-            break tabs;
+            break if unidentified {
+                mux.sidebar_tabs()?
+            } else {
+                tabs
+            };
         }
-        if std::time::Instant::now() >= deadline {
+        if started.elapsed() >= std::time::Duration::from_secs(5) {
             bail!("Zellij did not finish creating layout slots in tabs {pending:?}");
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -793,7 +810,7 @@ fn finish_sidebar_updates(instance_id: &str, updates: &[SidebarUpdate<'_>]) -> R
             Err(error) => errors.push(format!("tab {}: {error}", update.tab.tab_id)),
         }
     }
-    let tabs = mux.sidebar_tabs()?;
+    let tabs = mux.sidebar_layout_tabs()?;
     for update in ready {
         let result = (|| -> Result<()> {
             let tab = tabs
@@ -945,11 +962,13 @@ pub(super) fn kill_all_sidebars(instance_id: &str) -> Result<()> {
 }
 
 pub(super) fn sidebar_is_only_pane(instance_id: &str, window_id: &str, pane_id: &str) -> bool {
-    backend(instance_id).sidebar_tabs().is_ok_and(|tabs| {
-        tabs.into_iter()
-            .find(|tab| tab.tab_id.to_string() == window_id)
-            .is_some_and(|tab| tab.panes.len() == 1 && tab.panes[0].pane_id == pane_id)
-    })
+    backend(instance_id)
+        .sidebar_layout_tabs()
+        .is_ok_and(|tabs| {
+            tabs.into_iter()
+                .find(|tab| tab.tab_id.to_string() == window_id)
+                .is_some_and(|tab| tab.panes.len() == 1 && tab.panes[0].pane_id == pane_id)
+        })
 }
 
 #[cfg(test)]

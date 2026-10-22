@@ -57,15 +57,15 @@ class LiveZellij:
         )
 
     def panes(self) -> list[dict[str, Any]]:
-        for attempt in range(5):
+        deadline = time.monotonic() + 3
+        while True:
             output = self.action("list-panes", "--json", "--all").stdout
             try:
                 return json.loads(output)
             except json.JSONDecodeError:
-                if attempt == 4:
+                if time.monotonic() > deadline:
                     raise
                 time.sleep(0.05)
-        raise AssertionError("Zellij did not return pane JSON")
 
     def sidebar(self, *args: str) -> None:
         result = subprocess.run(
@@ -412,7 +412,7 @@ def test_sidebar_preserves_feature_tabs(
         started = time.monotonic()
         live_zellij.sidebar("on", "--position", position)
         elapsed = time.monotonic() - started
-        assert count != 2 or elapsed < 5, f"sidebar activation took {elapsed:.3f}s"
+        assert count != 2 or elapsed < 2.5, f"sidebar activation took {elapsed:.3f}s"
 
         after = [pane for pane in live_zellij.panes() if not pane["is_plugin"]]
         assert len(after) == len(before) + len(original_order), after

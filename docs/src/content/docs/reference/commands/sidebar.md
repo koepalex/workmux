@@ -158,7 +158,9 @@ layout slots are removed without closing the original running panes. Closing
 the sidebar reapplies the content-only layout so the original panes retain
 their order and fill the tab. Layout changes are serialized with background
 synchronization, and pane observations are shared across tabs to keep toggles
-responsive. workmux does not install Zellij hooks.
+responsive. Snapshots taken during a layout change use Zellij's plain pane
+table, which skips the per-pane command lookups that JSON output performs.
+workmux does not install Zellij hooks.
 
 ### Session-scoped mode
 
