@@ -23,6 +23,7 @@ use super::template::layout::{
 };
 use super::template::parser::Token;
 use super::template::row::{GroupStatusCount, HeaderContext};
+use crate::util::display_width;
 
 /// Compute pane suffixes like " (1)", " (2)" for agents sharing the same window.
 fn compute_pane_suffixes(agents: &[AgentPane]) -> Vec<String> {
@@ -510,7 +511,16 @@ pub fn render_sidebar(f: &mut Frame, app: &mut SidebarApp) {
 /// on groups are listed while grouping is on, since that is the only time they
 /// have anything to act on.
 fn help_entries(app: &SidebarApp) -> Vec<(&'static str, &'static str)> {
-    let mut entries = vec![("j k", "move"), ("g G", "first last"), ("enter", "jump")];
+    let enter_label = match app.enter_action {
+        crate::config::SidebarEnterAction::Focus => "focus pane",
+        crate::config::SidebarEnterAction::Select => "show window",
+    };
+    let mut entries = vec![
+        ("j k", "move"),
+        ("g G", "first last"),
+        ("enter", enter_label),
+        ("o", "focus pane"),
+    ];
     if app.group_by.is_some() {
         entries.extend([
             ("h l", "fold unfold"),
@@ -1199,7 +1209,7 @@ fn render_compact_list(f: &mut Frame, app: &mut SidebarApp, area: Rect) {
         .collect();
 
     // Own the offset so the sticky header describes this frame, not the last.
-    let selected = app.list_state.selected().unwrap_or(0);
+    let selected = app.viewport_selection().unwrap_or(0);
     let height = area.height as usize;
     let full_start = compact_offset(app.list_state.offset(), selected, height);
 
@@ -1252,7 +1262,17 @@ fn render_compact_list(f: &mut Frame, app: &mut SidebarApp, area: Rect) {
         .scroll_padding(0)
         .highlight_style(Style::default().bg(app.palette.highlight_row_bg));
 
-    f.render_stateful_widget(list, list_area, &mut app.list_state);
+    render_list(f, app, list, list_area);
+}
+
+/// Keep host highlighting independent of ratatui's selection-driven scrolling.
+fn render_list(f: &mut Frame, app: &mut SidebarApp, list: List<'_>, area: Rect) {
+    let selected = app.list_state.selected();
+    if app.viewport_selection().is_none() {
+        app.list_state.select(None);
+    }
+    f.render_stateful_widget(list, area, &mut app.list_state);
+    app.list_state.select(selected);
 }
 
 /// Fully visible tiles and the space reserved for their overflow indicator.
@@ -1564,7 +1584,7 @@ fn render_tile_list(f: &mut Frame, app: &mut SidebarApp, area: Rect) {
 
     let heights: Vec<_> = items.iter().map(ListItem::height).collect();
     app.tile_heights.clone_from(&heights);
-    let selected_row = app.list_state.selected().unwrap_or(app.list_state.offset());
+    let selected_row = app.viewport_selection().unwrap_or(0);
     let full_height = area.height as usize;
     let full_view = tile_viewport(&heights, app.list_state.offset(), selected_row, full_height);
 
@@ -1634,7 +1654,7 @@ fn render_tile_list(f: &mut Frame, app: &mut SidebarApp, area: Rect) {
 
     // Selection backgrounds belong to tile content, not separators or the footer.
     let list = List::new(items).scroll_padding(0);
-    f.render_stateful_widget(list, list_area, &mut app.list_state);
+    render_list(f, app, list, list_area);
 
     if let Some(view) = viewport.filter(|view| view.more) {
         // Count agents, including the ones a collapsed toggle stands for,
@@ -1762,13 +1782,6 @@ fn no_agents_line(app: &SidebarApp) -> Line<'static> {
     }
 }
 
-/// Get the display width of a string, counting wide chars as 2.
-pub(crate) fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| UnicodeWidthChar::width(c).unwrap_or(1))
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use ratatui::Terminal;
@@ -1777,6 +1790,19 @@ mod tests {
     use super::*;
     use crate::agent_display::{sanitize_pane_title, strip_oc_title_prefix};
     use crate::command::sidebar::app::TemplateError;
+
+    #[test]
+    fn help_describes_enter_action_and_explicit_focus_key() {
+        let mut app = SidebarApp::test_with_template_error(TemplateError {
+            location: String::new(),
+            message: String::new(),
+        });
+        assert!(help_entries(&app).contains(&("enter", "focus pane")));
+        assert!(help_entries(&app).contains(&("o", "focus pane")));
+
+        app.enter_action = crate::config::SidebarEnterAction::Select;
+        assert!(help_entries(&app).contains(&("enter", "show window")));
+    }
 
     fn tile_fixture() -> SidebarApp {
         use super::super::template::parser::parse_line;
@@ -1817,12 +1843,47 @@ mod tests {
                 window_cmd: None,
                 agent_command: None,
                 agent_kind: None,
+                prompt: None,
             });
         }
         app.rebuild_rows();
-        app.list_state.select(Some(0));
+        app.select_index(0);
         app.host_agent_idx = Some(5);
         app
+    }
+
+    #[test]
+    fn host_highlight_keeps_viewport_at_top_until_manual_navigation() {
+        for mode in [SidebarLayoutMode::Compact, SidebarLayoutMode::Tiles] {
+            let mut app = SidebarApp::test_with_template_error(TemplateError {
+                location: String::new(),
+                message: String::new(),
+            });
+            app.template_error = None;
+            app.layout_mode = mode;
+            app.agents = tile_fixture().agents;
+            app.rebuild_rows();
+            app.host_agent_idx = Some(5);
+            *app.list_state.offset_mut() = 4;
+            app.sync_selection();
+
+            let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+            for _ in 0..2 {
+                terminal.draw(|f| render_sidebar(f, &mut app)).unwrap();
+                assert_eq!(app.list_state.offset(), 0, "{mode:?}");
+                assert_eq!(app.selected_agent_idx(), Some(5));
+                assert!((0..5).any(|y| {
+                    buffer_row(terminal.backend().buffer(), y).contains("auth-refresh")
+                }));
+            }
+
+            app.select_index(5);
+            terminal.draw(|f| render_sidebar(f, &mut app)).unwrap();
+            assert!(app.list_state.offset() > 0, "{mode:?}");
+            assert!((0..5).any(|y| {
+                buffer_row(terminal.backend().buffer(), y).contains("sidebar-groups")
+            }));
+        }
     }
 
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
@@ -2243,6 +2304,7 @@ mod tests {
                 window_cmd: None,
                 agent_command: Some("claude".to_string()),
                 agent_kind: Some("claude".to_string()),
+                prompt: None,
             })
             .collect();
         app.rebuild_rows();
@@ -2324,12 +2386,12 @@ mod tests {
                 )
             })
             .collect();
-        // Waiting first, stale last: the order the header should be read in.
-        // The working icon is an animation frame, so only its count is fixed.
+        // Waiting and unacknowledged completion precede working, even without
+        // activity timestamps. The working icon is an animation frame.
         assert_eq!(tally.len(), 3);
         assert_eq!(tally[0], ("\u{1f4ac}".to_string(), 1));
-        assert_eq!(tally[1].1, 1);
-        assert_eq!(tally[2], ("\u{1f4a4}".to_string(), 1));
+        assert_eq!(tally[1], ("\u{2705}".to_string(), 1));
+        assert_eq!(tally[2].1, 1);
 
         // The tally reaches the drawn header, not just the helper.
         let lines = rendered(&mut app, 36, 26);
