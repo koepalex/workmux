@@ -2258,6 +2258,16 @@ pub fn run() -> Result<()> {
 
         if scheduler.observation_due(now) {
             scheduler.finish_observation(now);
+            if mux.name() == "zellij" {
+                match super::session_state::try_lock_layout(&instance_id) {
+                    Ok(Some(guard)) => drop(guard),
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to check Zellij layout lock");
+                        continue;
+                    }
+                }
+            }
             match query_mux_state(mux.as_ref(), &instance_id) {
                 Ok((tmux_state, zellij_tabs)) => {
                     if let Some(tabs) = zellij_tabs

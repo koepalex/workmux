@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -53,6 +53,35 @@ fn lock_path(instance_id: &str) -> PathBuf {
         "workmux-sidebar-state-{:016x}.lock",
         instance_key(instance_id)
     ))
+}
+
+fn layout_lock_file(instance_id: &str) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path(instance_id).with_extension("layout.lock"))
+        .context("failed to open Zellij sidebar layout lock")
+}
+
+pub(super) fn lock_layout(instance_id: &str) -> Result<File> {
+    let file = layout_lock_file(instance_id)?;
+    file.lock()
+        .context("failed to lock Zellij sidebar layout")?;
+    Ok(file)
+}
+
+pub(super) fn try_lock_layout(instance_id: &str) -> Result<Option<File>> {
+    let file = layout_lock_file(instance_id)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(error)) => {
+            Err(error).context("failed to lock Zellij sidebar layout")
+        }
+    }
 }
 
 struct StateLock {
@@ -143,6 +172,16 @@ mod tests {
         assert_eq!(path("alpha"), path("alpha"));
         assert_ne!(path("alpha"), path("beta"));
         assert_ne!(path("alpha"), socket_path("alpha"));
+    }
+
+    #[test]
+    fn layout_updates_exclude_concurrent_synchronization_and_release_on_drop() {
+        let instance = format!("sidebar-layout-test-{:016x}", getrandom::u64().unwrap());
+        let guard = lock_layout(&instance).unwrap();
+        assert!(try_lock_layout(&instance).unwrap().is_none());
+        drop(guard);
+        assert!(try_lock_layout(&instance).unwrap().is_some());
+        fs::remove_file(path(&instance).with_extension("layout.lock")).unwrap();
     }
 
     #[test]

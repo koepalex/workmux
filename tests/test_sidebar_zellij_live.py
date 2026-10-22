@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import termios
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,7 +57,15 @@ class LiveZellij:
         )
 
     def panes(self) -> list[dict[str, Any]]:
-        return json.loads(self.action("list-panes", "--json", "--all").stdout)
+        for attempt in range(5):
+            output = self.action("list-panes", "--json", "--all").stdout
+            try:
+                return json.loads(output)
+            except json.JSONDecodeError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05)
+        raise AssertionError("Zellij did not return pane JSON")
 
     def sidebar(self, *args: str) -> None:
         result = subprocess.run(
@@ -77,7 +86,11 @@ class LiveZellij:
 
 
 @pytest.fixture
-def live_zellij(workmux_exe_path: Path) -> Iterator[LiveZellij]:
+def live_zellij(
+    workmux_exe_path: Path, request: pytest.FixtureRequest
+) -> Iterator[LiveZellij]:
+    real_daemon = getattr(request, "param", False)
+    columns, rows = (320, 70) if real_daemon else (160, 45)
     zellij = shutil.which("zellij")
     if zellij is None:
         pytest.skip("Zellij is not installed")
@@ -128,14 +141,17 @@ def live_zellij(workmux_exe_path: Path) -> Iterator[LiveZellij]:
             key = ((key ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
         # Keep the renderer connected without a daemon changing the layout during assertions.
         with socket.socket(socket.AF_UNIX) as listener:
-            listener.bind(str(root / f"workmux-sidebar-{key:016x}.sock"))
-            listener.listen(32)
+            if not real_daemon:
+                listener.bind(str(root / f"workmux-sidebar-{key:016x}.sock"))
+                listener.listen(32)
             pid, master = pty.fork()
             if pid == 0:
                 os.chdir(root)
                 os.execve(zellij, [zellij, "--session", session], env)
-            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 160, 0, 0))
-            screen = TerminalScreen(160, 45)
+            fcntl.ioctl(
+                master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0)
+            )
+            screen = TerminalScreen(columns, rows)
             stream = pyte.ByteStream(screen)
             output = bytearray()
 
@@ -176,6 +192,8 @@ def live_zellij(workmux_exe_path: Path) -> Iterator[LiveZellij]:
                 ), screen.display
                 yield harness
             finally:
+                if real_daemon:
+                    harness.sidebar("off")
                 subprocess.run(
                     [zellij, "kill-session", session],
                     env=env,
@@ -251,18 +269,19 @@ def test_sidebar_retains_nested_content(live_zellij: LiveZellij):
     assert len(before) == 3
     original_ids = {pane["id"] for pane in before}
     original_order = sorted(before, key=lambda pane: (pane["pane_x"], pane["pane_y"]))
-    live_zellij.sidebar("on")
-    content = {
-        pane["id"]: pane for pane in live_zellij.panes() if not pane["is_plugin"]
-    }
-    assert len(content) == 4
-    assert original_ids <= content.keys()
-    left, top, bottom = [content[pane["id"]] for pane in original_order]
-    assert top["pane_x"] == bottom["pane_x"] == left["pane_x"] + left["pane_columns"]
-    assert top["pane_y"] == left["pane_y"]
-    assert bottom["pane_y"] == top["pane_y"] + top["pane_rows"]
-    assert top["pane_rows"] + bottom["pane_rows"] == left["pane_rows"]
-    assert abs(left["pane_columns"] - top["pane_columns"]) <= 1
+    for action in ("on", "off", "on", "off"):
+        live_zellij.sidebar(action)
+        content = {
+            pane["id"]: pane for pane in live_zellij.panes() if not pane["is_plugin"]
+        }
+        assert len(content) == (4 if action == "on" else 3)
+        assert original_ids <= content.keys()
+        left, top, bottom = [content[pane["id"]] for pane in original_order]
+        assert top["pane_x"] == bottom["pane_x"] == left["pane_x"] + left["pane_columns"]
+        assert top["pane_y"] == left["pane_y"]
+        assert bottom["pane_y"] == top["pane_y"] + top["pane_rows"]
+        assert top["pane_rows"] + bottom["pane_rows"] == left["pane_rows"]
+        assert abs(left["pane_columns"] - top["pane_columns"]) <= 1
 
 
 def test_damaged_bars_can_be_reloaded_without_closing_panes(live_zellij: LiveZellij):
@@ -322,10 +341,20 @@ def test_sidebar_keeps_side_by_side_row(
     assert len({pane["pane_rows"] for pane in content}) == 1, content
 
 
-@pytest.mark.parametrize("position", ["left", "top"])
-@pytest.mark.parametrize("count", [2, 4])
+@pytest.mark.parametrize(
+    ("count", "position", "closing", "live_zellij"),
+    [
+        (2, "left", "off", False),
+        (4, "left", "off", False),
+        (2, "top", "off", False),
+        (4, "top", "off", False),
+        (2, "left", "off", True),
+        (2, "left", "quit", True),
+    ],
+    indirect=["live_zellij"],
+)
 def test_sidebar_preserves_feature_tabs(
-    live_zellij: LiveZellij, position: str, count: int
+    live_zellij: LiveZellij, position: str, count: int, closing: str
 ):
     (live_zellij.root / ".workmux.yaml").write_text(
         "worktree_dir: .worktrees\n"
@@ -380,7 +409,10 @@ def test_sidebar_preserves_feature_tabs(
     original_titles = {pane["id"]: pane["title"] for pane in before}
 
     for _ in range(2):
+        started = time.monotonic()
         live_zellij.sidebar("on", "--position", position)
+        elapsed = time.monotonic() - started
+        assert count != 2 or elapsed < 5, f"sidebar activation took {elapsed:.3f}s"
 
         after = [pane for pane in live_zellij.panes() if not pane["is_plugin"]]
         assert len(after) == len(before) + len(original_order), after
@@ -404,3 +436,59 @@ def test_sidebar_preserves_feature_tabs(
                 )
                 == 1
             ), after
+
+        if closing == "off":
+            live_zellij.sidebar("off")
+        else:
+            sidebar = next(
+                pane for pane in after
+                if pane["title"] == "workmux-sidebar"
+                and len(original_order[pane["tab_id"]]) > 1
+            )
+            live_zellij.action("focus-pane-id", f"terminal_{sidebar['id']}")
+            assert poll_until(
+                lambda: any("workmux" in line.lower() for line in live_zellij.screen.display)
+            ), live_zellij.screen.display
+            live_zellij.action("write-chars", "qy")
+
+            def restored() -> bool:
+                panes = live_zellij.panes()
+                return not any(pane["title"] == "workmux-sidebar" for pane in panes) and all(
+                    [
+                        pane["id"]
+                        for pane in sorted(
+                            (
+                                pane for pane in panes
+                                if not pane["is_plugin"] and pane["tab_id"] == tab_id
+                            ),
+                            key=lambda pane: (pane["pane_x"], pane["pane_y"]),
+                        )
+                    ] == pane_ids
+                    for tab_id, pane_ids in original_order.items()
+                )
+
+            assert poll_until(
+                restored,
+                timeout=10,
+            ), [
+                (pane["id"], pane["title"], pane["tab_id"], pane["pane_x"], pane["pane_y"])
+                for pane in live_zellij.panes() if not pane["is_plugin"]
+            ]
+        closed = [pane for pane in live_zellij.panes() if not pane["is_plugin"]]
+        assert {pane["id"] for pane in closed} == set(original_titles), closed
+        for tab_id, pane_ids in original_order.items():
+            content = sorted(
+                (pane for pane in closed if pane["tab_id"] == tab_id),
+                key=lambda pane: (pane["pane_x"], pane["pane_y"]),
+            )
+            assert [pane["id"] for pane in content] == pane_ids, content
+            assert len({pane["pane_y"] for pane in content}) == 1, content
+            assert content[0]["pane_x"] == 0, content
+            assert sum(pane["pane_columns"] for pane in content) == max(
+                pane["pane_x"] + pane["pane_columns"]
+                for pane in before if pane["tab_id"] == tab_id
+            ), content
+            if count == 2:
+                assert max(pane["pane_columns"] for pane in content) - min(
+                    pane["pane_columns"] for pane in content
+                ) <= 1, content

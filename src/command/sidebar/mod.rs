@@ -593,7 +593,7 @@ fn on_zellij(
     let instance_id = mux.instance_id();
     let previous = session_state::read(&instance_id).unwrap_or_default();
     if previous.position.is_some_and(|current| current != position) {
-        zellij_panes::kill_all_sidebars(&instance_id, None);
+        zellij_panes::kill_all_sidebars(&instance_id)?;
     }
     let width = config.sidebar.width.clone();
     let height = config.sidebar.height.clone();
@@ -608,11 +608,11 @@ fn on_zellij(
     zellij_panes::create_sidebars_in_all_tabs(&instance_id, position, true)
 }
 
-fn off_zellij(mux: &dyn Multiplexer) {
+fn off_zellij(mux: &dyn Multiplexer) -> Result<()> {
     let instance_id = mux.instance_id();
-    let _ = session_state::update(&instance_id, |state| state.enabled = false);
-    zellij_panes::kill_all_sidebars(&instance_id, None);
+    session_state::update(&instance_id, |state| state.enabled = false)?;
     kill_daemon();
+    zellij_panes::kill_all_sidebars(&instance_id)
 }
 
 /// Ensure the sidebar is running globally across all tmux windows.
@@ -657,7 +657,7 @@ pub fn on(
 pub fn off() -> Result<()> {
     let mux = sidebar_mux()?;
     if mux.name() == "zellij" {
-        off_zellij(mux.as_ref());
+        off_zellij(mux.as_ref())?;
     } else {
         stop_all();
     }
@@ -674,7 +674,7 @@ pub fn toggle(
     if mux.name() == "zellij" {
         let instance_id = mux.instance_id();
         return if zellij_panes::current_tab_has_sidebar(&instance_id).unwrap_or(false) {
-            off_zellij(mux.as_ref());
+            off_zellij(mux.as_ref())?;
             Ok(())
         } else {
             on_zellij(mux.as_ref(), position, width, height)
@@ -756,7 +756,7 @@ pub fn on_session(
 pub fn off_session() -> Result<()> {
     let mux = sidebar_mux()?;
     if mux.name() == "zellij" {
-        off_zellij(mux.as_ref());
+        off_zellij(mux.as_ref())?;
         return Ok(());
     }
     let scope = current_scope();

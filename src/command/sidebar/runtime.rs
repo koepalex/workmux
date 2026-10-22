@@ -63,6 +63,9 @@ pub fn run_sidebar() -> Result<()> {
         tracing::info!("sidebar-run exiting: mux not running");
         return Ok(());
     }
+    if mux.name() == "zellij" {
+        drop(super::session_state::lock_layout(&mux.instance_id())?);
+    }
 
     // Create app BEFORE entering raw mode: terminal_light::luma() queries
     // the terminal via stdin, which would race with the input reader thread.

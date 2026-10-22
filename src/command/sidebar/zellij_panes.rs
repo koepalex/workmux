@@ -405,6 +405,7 @@ fn content_container(
     container
 }
 
+#[cfg(test)]
 fn layout_with_sidebar(
     dumped_layout: &str,
     tab_position: u32,
@@ -412,6 +413,20 @@ fn layout_with_sidebar(
     size: KdlValue,
     executable: &str,
     cwd: &str,
+    retained: &RetainedContent<'_>,
+) -> Result<String> {
+    layout_for_tab(
+        dumped_layout,
+        tab_position,
+        Some((position, sidebar_pane(size, executable, cwd))),
+        retained,
+    )
+}
+
+fn layout_for_tab(
+    dumped_layout: &str,
+    tab_position: u32,
+    sidebar: Option<(SidebarPosition, KdlNode)>,
     retained: &RetainedContent<'_>,
 ) -> Result<String> {
     let document =
@@ -439,30 +454,27 @@ fn layout_with_sidebar(
         bail!("dumped Zellij tab has no terminal content panes");
     }
 
-    let mut wrapper = KdlNode::new("pane");
-    property(
-        &mut wrapper,
-        "split_direction",
-        match position {
-            SidebarPosition::Left => "vertical",
-            SidebarPosition::Top => "horizontal",
-        },
-    );
-    let sidebar = sidebar_pane(size, executable, cwd);
-    let mut swap_wrapper = wrapper.clone();
-    let mut swap_wrapper_children = KdlDocument::new();
-    swap_wrapper_children.nodes_mut().push(sidebar.clone());
-    swap_wrapper_children
-        .nodes_mut()
-        .push(bare_content_container(&content, original_direction.clone()));
-    swap_wrapper.set_children(swap_wrapper_children);
-
-    let mut wrapper_children = KdlDocument::new();
-    wrapper_children.nodes_mut().push(sidebar);
-    wrapper_children
-        .nodes_mut()
-        .push(content_container(content, original_direction, retained));
-    wrapper.set_children(wrapper_children);
+    let mut swap_wrapper = bare_content_container(&content, original_direction.clone());
+    let mut wrapper = content_container(content, original_direction, retained);
+    if let Some((position, sidebar)) = sidebar {
+        let wrap = |content: KdlNode, sidebar: KdlNode| {
+            let mut node = KdlNode::new("pane");
+            property(
+                &mut node,
+                "split_direction",
+                match position {
+                    SidebarPosition::Left => "vertical",
+                    SidebarPosition::Top => "horizontal",
+                },
+            );
+            let mut children = KdlDocument::new();
+            children.nodes_mut().extend([sidebar, content]);
+            node.set_children(children);
+            node
+        };
+        wrapper = wrap(wrapper, sidebar.clone());
+        swap_wrapper = wrap(swap_wrapper, sidebar);
+    }
 
     let mut replacement_children = KdlDocument::new();
     let mut swap_children = KdlDocument::new();
@@ -524,20 +536,12 @@ fn layout_with_sidebar(
 }
 
 fn close_generated_terminal_placeholders(
-    instance_id: &str,
-    tab_id: u32,
+    mux: &ZellijBackend,
+    tab: &ZellijSidebarTab,
     original_pane_ids: &HashSet<String>,
     placeholder_name: &str,
 ) -> Result<()> {
-    let mux = backend(instance_id);
-    let Some(tab) = mux
-        .sidebar_tabs()?
-        .into_iter()
-        .find(|tab| tab.tab_id == tab_id)
-    else {
-        return Ok(());
-    };
-    for pane in tab.panes {
+    for pane in &tab.panes {
         let is_placeholder = pane.title == placeholder_name
             || pane
                 .command
@@ -550,45 +554,52 @@ fn close_generated_terminal_placeholders(
     Ok(())
 }
 
+struct SidebarUpdate<'a> {
+    tab: &'a ZellijSidebarTab,
+    placeholder_name: String,
+    focus_pane_id: &'a str,
+    select_tab: bool,
+    slot_count: usize,
+}
+
 fn restore_pane_slots(
     instance_id: &str,
     tab_id: u32,
     original: &std::collections::HashMap<String, PaneRect>,
+    panes: &[ZellijSidebarPane],
 ) -> Result<()> {
     if original.len() < 2 {
         return Ok(());
     }
     let mux = backend(instance_id);
-    let current_tab = mux
-        .sidebar_tabs()?
-        .into_iter()
-        .find(|tab| tab.tab_id == tab_id)
-        .ok_or_else(|| anyhow!("Zellij tab {tab_id} disappeared during layout override"))?;
-    let current: std::collections::HashMap<String, PaneRect> = current_tab
-        .panes
-        .iter()
-        .filter(|pane| original.contains_key(&pane.pane_id))
-        .filter_map(|pane| pane_rect(pane).map(|rect| (pane.pane_id.clone(), rect)))
-        .collect();
+    let geometry = |panes: &[ZellijSidebarPane]| -> std::collections::HashMap<String, PaneRect> {
+        panes
+            .iter()
+            .filter(|pane| original.contains_key(&pane.pane_id))
+            .filter_map(|pane| pane_rect(pane).map(|rect| (pane.pane_id.clone(), rect)))
+            .collect()
+    };
+    let mut current = geometry(panes);
     if current.len() != original.len() {
         bail!("Zellij did not report geometry for all retained panes in tab {tab_id}");
     }
     let targets = target_slots(original, &current)?;
     let mut ordered_targets: Vec<_> = targets.iter().collect();
-    ordered_targets.sort_by_key(|(_, rect)| std::cmp::Reverse(rect.area()));
+    let first = ordered_targets[0].1;
+    let aligned = targets
+        .values()
+        .all(|rect| rect.y == first.y && rect.height == first.height)
+        || targets
+            .values()
+            .all(|rect| rect.x == first.x && rect.width == first.width);
+    if aligned {
+        // Finish the leading slots first; otherwise fixing a later slot can undo the previous move.
+        ordered_targets.sort_by_key(|(_, rect)| (rect.x, rect.y));
+    } else {
+        ordered_targets.sort_by_key(|(_, rect)| (std::cmp::Reverse(rect.area()), rect.x, rect.y));
+    }
 
     for _ in 0..original.len().saturating_mul(original.len()).max(1) {
-        let current_tab = mux
-            .sidebar_tabs()?
-            .into_iter()
-            .find(|tab| tab.tab_id == tab_id)
-            .ok_or_else(|| anyhow!("Zellij tab {tab_id} disappeared while restoring pane order"))?;
-        let current: std::collections::HashMap<String, PaneRect> = current_tab
-            .panes
-            .iter()
-            .filter(|pane| targets.contains_key(&pane.pane_id))
-            .filter_map(|pane| pane_rect(pane).map(|rect| (pane.pane_id.clone(), rect)))
-            .collect();
         let Some((pane_id, target, rect, direction)) =
             ordered_targets.iter().find_map(|(pane_id, target)| {
                 let rect = current.get(*pane_id)?;
@@ -599,13 +610,11 @@ fn restore_pane_slots(
             return Ok(());
         };
         mux.move_pane_by_id(&pane_id, direction)?;
-        let updated = mux
-            .sidebar_tabs()?
-            .into_iter()
-            .find(|tab| tab.tab_id == tab_id)
-            .and_then(|tab| tab.panes.into_iter().find(|pane| pane.pane_id == pane_id))
-            .and_then(|pane| pane_rect(&pane));
-        if updated == Some(rect) {
+        current = geometry(&mux.sidebar_tab_panes(tab_id)?);
+        if current.len() != original.len() {
+            bail!("Zellij lost retained panes while restoring pane order in tab {tab_id}");
+        }
+        if current.get(&pane_id) == Some(&rect) {
             bail!(
                 "Zellij could not move pane {pane_id} {direction} toward its original slot {target:?}"
             );
@@ -622,36 +631,31 @@ fn create_sidebar_in_tab(
     replace_existing: bool,
     select_tab: bool,
 ) -> Result<()> {
-    let mux = backend(instance_id);
-    // The daemon may have taken its session snapshot before another tab was processed.
-    let Some(tab) = mux
-        .sidebar_tabs()?
-        .into_iter()
-        .find(|current| current.tab_id == tab.tab_id)
-    else {
-        return Ok(());
-    };
-    create_sidebar_in_tab_from_snapshot(
+    if let Some(update) = apply_tab_layout(
         instance_id,
-        &tab,
-        position,
-        config,
+        tab,
+        Some((position, config)),
         replace_existing,
         select_tab,
-    )
+    )? {
+        finish_sidebar_updates(instance_id, &[update])?;
+    }
+    Ok(())
 }
 
-fn create_sidebar_in_tab_from_snapshot(
+fn apply_tab_layout<'a>(
     instance_id: &str,
-    tab: &ZellijSidebarTab,
-    position: SidebarPosition,
-    config: &Config,
+    tab: &'a ZellijSidebarTab,
+    sidebar: Option<(SidebarPosition, &Config)>,
     replace_existing: bool,
     select_tab: bool,
-) -> Result<()> {
+) -> Result<Option<SidebarUpdate<'a>>> {
     let mux = backend(instance_id);
-    if tab.panes.iter().any(|pane| is_sidebar_pane(&pane.title)) && !replace_existing {
-        return Ok(());
+    let has_sidebar = tab.panes.iter().any(|pane| is_sidebar_pane(&pane.title));
+    if (sidebar.is_some() && has_sidebar && !replace_existing)
+        || (sidebar.is_none() && !has_sidebar)
+    {
+        return Ok(None);
     }
     let Some(target) = tab
         .panes
@@ -659,51 +663,36 @@ fn create_sidebar_in_tab_from_snapshot(
         .find(|pane| !is_sidebar_pane(&pane.title) && pane.is_focused)
         .or_else(|| tab.panes.iter().find(|pane| !is_sidebar_pane(&pane.title)))
     else {
-        return Ok(());
+        return Ok(None);
     };
-    let original_pane_ids: HashSet<String> = tab
-        .panes
-        .iter()
-        .filter(|pane| !is_sidebar_pane(&pane.title))
-        .map(|pane| pane.pane_id.clone())
-        .collect();
-    let original_pane_rects: std::collections::HashMap<String, PaneRect> = tab
-        .panes
-        .iter()
-        .filter(|pane| !is_sidebar_pane(&pane.title) && !pane.is_floating)
-        .filter_map(|pane| pane_rect(pane).map(|rect| (pane.pane_id.clone(), rect)))
-        .collect();
-    let extent = tab_extent(tab, position)
-        .ok_or_else(|| anyhow!("Zellij tab {} has no pane geometry", tab.tab_id))?;
-    let size = sidebar_size(config, position, extent);
-    let executable = std::env::current_exe()?;
-    let executable = executable
-        .to_str()
-        .ok_or_else(|| anyhow!("exe path not UTF-8"))?;
-    let cwd = std::env::current_dir()?;
-    let cwd = cwd
-        .to_str()
-        .ok_or_else(|| anyhow!("current directory path not UTF-8"))?;
-
-    debug!(
-        tab_id = tab.tab_id,
-        ?position,
-        "overriding Zellij tab layout"
-    );
+    let sidebar = if let Some((position, config)) = sidebar {
+        let extent = tab_extent(tab, position)
+            .ok_or_else(|| anyhow!("Zellij tab {} has no pane geometry", tab.tab_id))?;
+        let size = sidebar_size(config, position, extent);
+        let executable = std::env::current_exe()?;
+        let executable = executable
+            .to_str()
+            .ok_or_else(|| anyhow!("exe path not UTF-8"))?;
+        let cwd = std::env::current_dir()?;
+        let cwd = cwd
+            .to_str()
+            .ok_or_else(|| anyhow!("current directory path not UTF-8"))?;
+        Some((position, sidebar_pane(size, executable, cwd)))
+    } else {
+        None
+    };
+    debug!(tab_id = tab.tab_id, "overriding Zellij tab layout");
     if select_tab {
         mux.go_to_tab_by_id(tab.tab_id)?;
     } else if !tab.active {
-        return Ok(());
+        return Ok(None);
     }
     let dumped = mux.dump_layout()?;
     let placeholder_name = format!("workmux-sidebar-placeholder-{:016x}", getrandom::u64()?);
-    let layout = layout_with_sidebar(
+    let layout = layout_for_tab(
         &dumped,
         tab.position,
-        position,
-        size,
-        executable,
-        cwd,
+        sidebar,
         &RetainedContent {
             placeholder_name: &placeholder_name,
             ui_plugin_aliases: tab.ui_plugin_aliases.clone(),
@@ -713,50 +702,137 @@ fn create_sidebar_in_tab_from_snapshot(
         mux.close_pane_by_id(&pane.pane_id)?;
     }
     mux.override_active_tab_layout(&layout)
-        .with_context(|| format!("failed to create sidebar in Zellij tab {}", tab.tab_id))?;
-    close_generated_terminal_placeholders(
-        instance_id,
-        tab.tab_id,
-        &original_pane_ids,
-        &placeholder_name,
-    )?;
-    mux.reapply_active_tab_layout()?;
-    let restored_tab = mux
-        .sidebar_tabs()?
-        .into_iter()
-        .find(|current| current.tab_id == tab.tab_id)
-        .ok_or_else(|| {
-            anyhow!(
-                "Zellij tab {} disappeared during layout override",
-                tab.tab_id
-            )
-        })?;
-    for pane in &restored_tab.panes {
-        // Zellij can apply temporary slot names to retained shells.
-        if (pane.title == placeholder_name || is_sidebar_pane(&pane.title))
-            && let Some(original) = tab
+        .with_context(|| format!("failed to update sidebar in Zellij tab {}", tab.tab_id))?;
+    Ok(Some(SidebarUpdate {
+        tab,
+        placeholder_name,
+        focus_pane_id: &target.pane_id,
+        select_tab,
+        slot_count: layout.matches("WORKMUX_SIDEBAR_PLACEHOLDER=").count(),
+    }))
+}
+
+fn finish_sidebar_updates(instance_id: &str, updates: &[SidebarUpdate<'_>]) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mux = backend(instance_id);
+    // Overrides acknowledge before spawning panes. Wait for every slot before cleanup.
+    // Each observation scans process trees, so share it across all changed tabs.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let tabs = loop {
+        let tabs = mux.sidebar_tabs()?;
+        let mut pending = Vec::new();
+        for update in updates {
+            let tab = tabs
+                .iter()
+                .find(|tab| tab.tab_id == update.tab.tab_id)
+                .ok_or_else(|| anyhow!("Zellij tab {} disappeared", update.tab.tab_id))?;
+            let slots = tab
                 .panes
                 .iter()
-                .find(|original| original.pane_id == pane.pane_id)
-            && !is_sidebar_pane(&original.title)
-        {
-            mux.set_pane_name(&pane.pane_id, &original.title)?;
+                .filter(|pane| {
+                    pane.title == update.placeholder_name
+                        || pane
+                            .command
+                            .as_deref()
+                            .is_some_and(|command| command.contains(&update.placeholder_name))
+                })
+                .count();
+            if slots < update.slot_count {
+                pending.push(tab.tab_id);
+            }
         }
-    }
-    for pane in tab.panes.iter().filter(|pane| pane.is_floating) {
-        if let Some(rect) = pane_rect(pane) {
-            mux.set_floating_pane_coordinates(
-                &pane.pane_id,
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
+        if pending.is_empty() {
+            break tabs;
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("Zellij did not finish creating layout slots in tabs {pending:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let mut errors = Vec::new();
+    let mut ready = Vec::new();
+    for update in updates {
+        let result = (|| -> Result<()> {
+            let tab = tabs
+                .iter()
+                .find(|tab| tab.tab_id == update.tab.tab_id)
+                .ok_or_else(|| anyhow!("Zellij tab {} disappeared", update.tab.tab_id))?;
+            let original_ids = update
+                .tab
+                .panes
+                .iter()
+                .map(|pane| pane.pane_id.clone())
+                .collect();
+            close_generated_terminal_placeholders(
+                &mux,
+                tab,
+                &original_ids,
+                &update.placeholder_name,
             )?;
+            if update.select_tab {
+                mux.go_to_tab_by_id(tab.tab_id)?;
+            }
+            mux.reapply_active_tab_layout()?;
+            for pane in update.tab.panes.iter().filter(|pane| pane.is_floating) {
+                if let Some(rect) = pane_rect(pane) {
+                    mux.set_floating_pane_coordinates(
+                        &pane.pane_id,
+                        rect.x,
+                        rect.y,
+                        rect.width,
+                        rect.height,
+                    )?;
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => ready.push(update),
+            Err(error) => errors.push(format!("tab {}: {error}", update.tab.tab_id)),
         }
     }
-    restore_pane_slots(instance_id, tab.tab_id, &original_pane_rects)?;
-    mux.focus_pane_by_id(&target.pane_id)?;
-    Ok(())
+    let tabs = mux.sidebar_tabs()?;
+    for update in ready {
+        let result = (|| -> Result<()> {
+            let tab = tabs
+                .iter()
+                .find(|tab| tab.tab_id == update.tab.tab_id)
+                .ok_or_else(|| anyhow!("Zellij tab {} disappeared", update.tab.tab_id))?;
+            for pane in &tab.panes {
+                // Zellij can apply temporary slot names to retained shells.
+                if (pane.title == update.placeholder_name || is_sidebar_pane(&pane.title))
+                    && let Some(original) = update
+                        .tab
+                        .panes
+                        .iter()
+                        .find(|original| original.pane_id == pane.pane_id)
+                    && !is_sidebar_pane(&original.title)
+                {
+                    mux.set_pane_name(&pane.pane_id, &original.title)?;
+                }
+            }
+            let original_rects = update
+                .tab
+                .panes
+                .iter()
+                .filter(|pane| !is_sidebar_pane(&pane.title) && !pane.is_floating)
+                .filter_map(|pane| pane_rect(pane).map(|rect| (pane.pane_id.clone(), rect)))
+                .collect();
+            restore_pane_slots(instance_id, tab.tab_id, &original_rects, &tab.panes)?;
+            mux.focus_pane_by_id(update.focus_pane_id)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            errors.push(format!("tab {}: {error}", update.tab.tab_id));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", errors.join("; "))
+    }
 }
 
 pub(super) fn create_sidebars_in_all_tabs(
@@ -768,25 +844,39 @@ pub(super) fn create_sidebars_in_all_tabs(
     let mut config = Config::load(None)?;
     config.sidebar.width = state.width;
     config.sidebar.height = state.height;
+    update_all_tabs(instance_id, Some((position, &config)), resize_existing)
+}
+
+fn update_all_tabs(
+    instance_id: &str,
+    sidebar: Option<(SidebarPosition, &Config)>,
+    replace_existing: bool,
+) -> Result<()> {
+    let _layout_lock = super::session_state::lock_layout(instance_id)?;
     let tabs = backend(instance_id).sidebar_tabs()?;
     let original_tab = tabs.iter().find(|tab| tab.active).map(|tab| tab.tab_id);
     let mut errors = Vec::new();
+    let mut updates = Vec::new();
     for tab in &tabs {
-        if let Err(error) =
-            create_sidebar_in_tab(instance_id, tab, position, &config, resize_existing, true)
-        {
-            errors.push(format!("tab {}: {error}", tab.tab_id));
+        match apply_tab_layout(instance_id, tab, sidebar, replace_existing, true) {
+            Ok(Some(update)) => updates.push(update),
+            Ok(None) => {}
+            Err(error) => errors.push(format!("tab {}: {error}", tab.tab_id)),
         }
     }
-    if let Some(tab_id) = original_tab {
-        let _ = backend(instance_id).go_to_tab_by_id(tab_id);
+    if let Err(error) = finish_sidebar_updates(instance_id, &updates) {
+        errors.push(error.to_string());
+    }
+    if let Some(tab_id) = original_tab
+        && let Err(error) = backend(instance_id).go_to_tab_by_id(tab_id)
+    {
+        errors.push(format!("failed to restore active tab {tab_id}: {error}"));
     }
     if errors.is_empty() {
         Ok(())
     } else {
         Err(anyhow!(
-            "failed to create sidebars in {} Zellij tab(s): {}",
-            errors.len(),
+            "failed to update Zellij sidebars: {}",
             errors.join("; ")
         ))
     }
@@ -796,6 +886,7 @@ pub(super) fn create_sidebar_in_active_tab(
     instance_id: &str,
     position: SidebarPosition,
 ) -> Result<()> {
+    let _layout_lock = super::session_state::lock_layout(instance_id)?;
     let state = super::session_state::read(instance_id)?;
     let mut config = Config::load(None)?;
     config.sidebar.width = state.width;
@@ -821,11 +912,24 @@ pub(super) fn create_sidebar_in_active_tab_from_snapshot(
     if tab.panes.iter().any(|pane| is_sidebar_pane(&pane.title)) {
         return Ok(());
     }
+    let Some(_layout_lock) = super::session_state::try_lock_layout(instance_id)? else {
+        return Ok(());
+    };
     let state = super::session_state::read(instance_id)?;
+    if !state.enabled {
+        return Ok(());
+    }
+    let Some(tab) = backend(instance_id)
+        .sidebar_tabs()?
+        .into_iter()
+        .find(|current| current.tab_id == tab.tab_id && current.active)
+    else {
+        return Ok(());
+    };
     let mut config = Config::load(None)?;
     config.sidebar.width = state.width;
     config.sidebar.height = state.height;
-    create_sidebar_in_tab_from_snapshot(instance_id, tab, position, &config, false, false)
+    create_sidebar_in_tab(instance_id, &tab, position, &config, false, false)
 }
 
 pub(super) fn current_tab_has_sidebar(instance_id: &str) -> Result<bool> {
@@ -836,29 +940,8 @@ pub(super) fn current_tab_has_sidebar(instance_id: &str) -> Result<bool> {
         .is_some_and(|tab| tab.panes.iter().any(|pane| is_sidebar_pane(&pane.title))))
 }
 
-pub(super) fn list_sidebar_panes(instance_id: &str) -> Result<Vec<(String, String)>> {
-    Ok(backend(instance_id)
-        .sidebar_tabs()?
-        .into_iter()
-        .flat_map(|tab| {
-            let window_id = tab.tab_id.to_string();
-            tab.panes
-                .into_iter()
-                .filter(|pane| is_sidebar_pane(&pane.title))
-                .map(move |pane| (window_id.clone(), pane.pane_id))
-        })
-        .collect())
-}
-
-pub(super) fn kill_all_sidebars(instance_id: &str, except_pane: Option<&str>) {
-    let mux = backend(instance_id);
-    let panes = list_sidebar_panes(instance_id).unwrap_or_default();
-    for (_, pane_id) in panes {
-        if except_pane == Some(pane_id.as_str()) {
-            continue;
-        }
-        let _ = mux.close_pane_by_id(&pane_id);
-    }
+pub(super) fn kill_all_sidebars(instance_id: &str) -> Result<()> {
+    update_all_tabs(instance_id, None, true)
 }
 
 pub(super) fn sidebar_is_only_pane(instance_id: &str, window_id: &str, pane_id: &str) -> bool {

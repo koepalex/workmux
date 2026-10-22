@@ -63,6 +63,25 @@ struct PaneInfo {
     plugin_url: Option<String>,
 }
 
+impl From<&PaneInfo> for ZellijSidebarPane {
+    fn from(pane: &PaneInfo) -> Self {
+        Self {
+            pane_id: format!("terminal_{}", pane.id),
+            title: pane.title.clone(),
+            command: pane
+                .pane_command
+                .clone()
+                .or_else(|| pane.terminal_command.clone()),
+            is_focused: pane.is_focused,
+            is_floating: pane.is_floating,
+            pane_x: pane.pane_x,
+            pane_y: pane.pane_y,
+            pane_columns: pane.pane_columns,
+            pane_rows: pane.pane_rows,
+        }
+    }
+}
+
 /// Info about a tab from `zellij action list-tabs --json`
 #[derive(Debug, serde::Deserialize)]
 struct TabInfo {
@@ -538,20 +557,7 @@ impl ZellijBackend {
                 panes: panes
                     .iter()
                     .filter(|pane| !pane.is_plugin && pane.tab_id == Some(tab.tab_id))
-                    .map(|pane| ZellijSidebarPane {
-                        pane_id: format!("terminal_{}", pane.id),
-                        title: pane.title.clone(),
-                        command: pane
-                            .pane_command
-                            .clone()
-                            .or_else(|| pane.terminal_command.clone()),
-                        is_focused: pane.is_focused,
-                        is_floating: pane.is_floating,
-                        pane_x: pane.pane_x,
-                        pane_y: pane.pane_y,
-                        pane_columns: pane.pane_columns,
-                        pane_rows: pane.pane_rows,
-                    })
+                    .map(ZellijSidebarPane::from)
                     .collect(),
             })
             .collect()
@@ -618,6 +624,31 @@ impl ZellijBackend {
 
     pub(crate) fn sidebar_tabs(&self) -> Result<Vec<ZellijSidebarTab>> {
         Ok(self.sidebar_observation()?.tabs)
+    }
+
+    pub(crate) fn sidebar_tab_panes(&self, tab_id: u32) -> Result<Vec<ZellijSidebarPane>> {
+        let panes: Vec<PaneInfo> = query_json_with_retry(
+            || {
+                self.command()
+                    .args(&[
+                        "action",
+                        "list-panes",
+                        "--json",
+                        "--geometry",
+                        "--state",
+                        "--tab",
+                    ])
+                    .run_and_capture_stdout()
+                    .context("Failed to list Zellij pane geometry")
+            },
+            "Failed to parse Zellij pane geometry",
+            Duration::from_millis(50),
+        )?;
+        Ok(panes
+            .iter()
+            .filter(|pane| !pane.is_plugin && pane.tab_id == Some(tab_id))
+            .map(ZellijSidebarPane::from)
+            .collect())
     }
 
     pub(crate) fn close_pane_by_id(&self, pane_id: &str) -> Result<()> {

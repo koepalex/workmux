@@ -119,17 +119,22 @@ elif action == "override-layout":
     layout = args[args.index("--layout-string") + 1]
     model["applied_layout"] = layout
     marker = re.search(r'name="(workmux-sidebar-placeholder-[^"]+)"', layout)
+    active_id = next(
+        (tab["tab_id"] for tab in model.get("tabs", []) if tab["active"]), 0
+    )
+    target = next(pane for pane in model["panes"] if pane["tab_id"] == active_id)
+    first_id = max(9, 1 + max(pane["id"] for pane in model["panes"]))
     for pane_id, title, pane_command in [
-        (9, "concurrent editor", "zsh"),
+        (first_id, "concurrent editor", "zsh"),
         (
-            10,
+            first_id + 1,
             "Pane #3",
             f'env WORKMUX_SIDEBAR_PLACEHOLDER={marker[1]} true' if marker else "env true",
         ),
-        (11, "workmux-sidebar", "env WORKMUX_BACKEND=zellij workmux _sidebar-run"),
+        (first_id + 2, "workmux-sidebar", "env WORKMUX_BACKEND=zellij workmux _sidebar-run"),
     ]:
         model["panes"].append(
-            model["panes"][0]
+            target
             | {
                 "id": pane_id,
                 "title": title,

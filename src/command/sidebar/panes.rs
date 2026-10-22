@@ -314,10 +314,29 @@ fn is_own_sidebar(pane_id: &str, own_pane_id: &str) -> bool {
 pub(super) fn shutdown_all_sidebars(identity: &HostIdentity) {
     let mux = crate::multiplexer::create_backend(crate::multiplexer::detect_backend());
     if mux.name() == "zellij" {
-        let instance_id = mux.instance_id();
-        let _ = super::session_state::update(&instance_id, |state| state.enabled = false);
-        super::zellij_panes::kill_all_sidebars(&instance_id, Some(&identity.pane_id));
-        kill_daemon();
+        use std::os::unix::process::CommandExt;
+        // The helper must survive closing this pane so it can restore this tab too.
+        let result = std::env::current_exe().and_then(|exe| {
+            let mut command = std::process::Command::new(exe);
+            command.args(["sidebar", "off"]);
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.output()
+        });
+        match result {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => tracing::warn!(
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "failed to stop Zellij sidebars"
+            ),
+            Err(error) => tracing::warn!(%error, "failed to stop Zellij sidebars"),
+        }
         return;
     }
 

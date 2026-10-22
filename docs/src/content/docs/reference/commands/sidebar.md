@@ -154,9 +154,11 @@ sidebars are applied with `override-layout`, retaining running terminal panes
 and wrapping the complete nested content tree. workmux also restores the
 visible pane ordering when Zellij's logical pane order differs from its layout
 order, including when enabled after multiple `workmux add` commands. Temporary
-layout slots are removed without closing the original running panes. Zellij
-restores the remaining layout when sidebars close, so workmux
-does not install hooks or run custom layout reflow.
+layout slots are removed without closing the original running panes. Closing
+the sidebar reapplies the content-only layout so the original panes retain
+their order and fill the tab. Layout changes are serialized with background
+synchronization, and pane observations are shared across tabs to keep toggles
+responsive. workmux does not install Zellij hooks.
 
 ### Session-scoped mode
 
