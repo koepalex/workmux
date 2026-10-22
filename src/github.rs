@@ -53,6 +53,14 @@ pub enum CheckState {
     Pending { passed: u32, total: u32 },
 }
 
+/// An issue GitHub reports as closed by a pull request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClosingIssue {
+    pub number: u32,
+    /// Repository name with owner, for example `raine/workmux`.
+    pub repository: String,
+}
+
 /// Summary of a PR found by head ref search
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PrSummary {
@@ -70,6 +78,9 @@ pub struct PrSummary {
     /// PR URL for opening in browser
     #[serde(default)]
     pub url: Option<String>,
+    /// Issues GitHub reports as closed by this pull request.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closing_issues: Vec<ClosingIssue>,
 }
 
 /// Metadata about PR checks (timing, names) separate from aggregated state
@@ -367,6 +378,7 @@ pub fn find_pr_by_head_ref(owner: &str, branch: &str) -> Result<Option<PrSummary
         checks: None,
         check_meta: None,
         url: pr.url,
+        closing_issues: Vec::new(),
     }))
 }
 
@@ -488,9 +500,16 @@ pub fn get_pr_details_in(repo_root: Option<&Path>, pr_number: u32) -> Result<PrD
     Ok(pr_details)
 }
 
+const PR_LIST_FIELDS_WITH_ISSUES_AND_CHECKS: &str =
+    "number,title,state,isDraft,headRefName,url,statusCheckRollup,closingIssuesReferences";
 const PR_LIST_FIELDS_WITH_CHECKS: &str =
     "number,title,state,isDraft,headRefName,url,statusCheckRollup";
 const PR_LIST_FIELDS: &str = "number,title,state,isDraft,headRefName,url";
+const DASHBOARD_PR_LIST_FIELD_SETS: [&str; 3] = [
+    PR_LIST_FIELDS_WITH_ISSUES_AND_CHECKS,
+    PR_LIST_FIELDS_WITH_CHECKS,
+    PR_LIST_FIELDS,
+];
 
 fn run_pr_list(
     repo_root: Option<&Path>,
@@ -502,6 +521,43 @@ fn run_pr_list(
         command.current_dir(path);
     }
     command.args(args).args(["--json", json_fields]).output()
+}
+
+fn run_pr_list_with_fallback(
+    field_sets: &[&str],
+    mut run: impl FnMut(&str) -> std::io::Result<std::process::Output>,
+) -> std::io::Result<std::process::Output> {
+    let mut last_output = None;
+    for fields in field_sets {
+        let output = run(fields)?;
+        if output.status.success() {
+            return Ok(output);
+        }
+        debug!(fields, stderr = %String::from_utf8_lossy(&output.stderr), "github:pr list failed, retrying with fewer JSON fields");
+        last_output = Some(output);
+    }
+    Ok(last_output.expect("PR field fallback requires at least one field set"))
+}
+
+#[derive(Debug, Deserialize)]
+struct RawClosingIssue {
+    number: u32,
+    repository: RawIssueRepository,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIssueRepository {
+    name: String,
+    owner: RepositoryOwner,
+}
+
+impl From<RawClosingIssue> for ClosingIssue {
+    fn from(issue: RawClosingIssue) -> Self {
+        Self {
+            number: issue.number,
+            repository: format!("{}/{}", issue.repository.owner.login, issue.repository.name),
+        }
+    }
 }
 
 /// Internal struct for parsing batch PR list results
@@ -517,6 +573,8 @@ struct PrBatchItem {
     url: String,
     #[serde(rename = "statusCheckRollup", default)]
     status_check_rollup: Vec<CheckRollupItem>,
+    #[serde(rename = "closingIssuesReferences", default)]
+    closing_issues: Vec<RawClosingIssue>,
 }
 
 /// Fetch all PRs for the repository containing `repo_root`.
@@ -564,6 +622,7 @@ pub fn list_prs_in(repo_root: Option<&Path>) -> Result<HashMap<String, PrSummary
                     checks,
                     check_meta,
                     url: Some(pr.url),
+                    closing_issues: Vec::new(),
                 }
             })
         })
@@ -614,6 +673,13 @@ struct GraphqlError {
     path: Vec<serde_json::Value>,
 }
 
+fn is_closing_issues_error(error: &GraphqlError) -> bool {
+    error
+        .path
+        .iter()
+        .any(|segment| segment.as_str() == Some("closingIssuesReferences"))
+}
+
 #[derive(Debug, Deserialize)]
 struct GraphqlPrConnection {
     nodes: Vec<GraphqlPrNode>,
@@ -633,6 +699,13 @@ struct GraphqlPrNode {
     is_draft: bool,
     url: String,
     commits: GraphqlCommits,
+    #[serde(rename = "closingIssuesReferences", default)]
+    closing_issues: Option<GraphqlClosingIssues>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphqlClosingIssues {
+    nodes: Vec<RawClosingIssue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -936,6 +1009,7 @@ fn build_batch_body(remotes: &[RemoteQuery]) -> Result<Vec<u8>> {
                 r#"    pr_r{repo_index}_b{branch_index}: pullRequests(headRefName: ${head_var}, first: 1, states: [OPEN, MERGED, CLOSED], orderBy: {{field: CREATED_AT, direction: DESC}}) {{
       nodes {{
         number title state isDraft url
+        closingIssuesReferences(first: 100) {{ nodes {{ number repository {{ name owner {{ login }} }} }} }}
         commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100) {{
           nodes {{ __typename ... on CheckRun {{ name status conclusion startedAt }} ... on StatusContext {{ context state createdAt }} }}
         }} }} }} }} }}
@@ -1029,11 +1103,12 @@ fn execute_remote_chunk_once(
         .map(|index| format!("repo_{index}"))
         .collect();
     if response.errors.iter().any(|error| {
-        error
-            .path
-            .first()
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|alias| !aliases.contains(alias))
+        !is_closing_issues_error(error)
+            && error
+                .path
+                .first()
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|alias| !aliases.contains(alias))
     }) {
         return Err(anyhow!("GraphQL response contained an unscoped error"));
     }
@@ -1071,7 +1146,8 @@ fn parse_remote_query(
         let pr_alias = format!("pr_r{repo_index}_b{branch_index}");
         let ref_alias = format!("ref_r{repo_index}_b{branch_index}");
         let branch_error = errors.iter().any(|error| {
-            error.path.len() >= 2
+            !is_closing_issues_error(error)
+                && error.path.len() >= 2
                 && error.path.first().and_then(serde_json::Value::as_str)
                     == Some(repo_alias.as_str())
                 && error
@@ -1118,6 +1194,10 @@ fn parse_branch_summary_values(
             checks,
             check_meta,
             url: Some(node.url),
+            closing_issues: node
+                .closing_issues
+                .map(|issues| issues.nodes.into_iter().map(Into::into).collect())
+                .unwrap_or_default(),
         }
     });
     let branch_checks = branch_ref
@@ -1150,13 +1230,17 @@ fn list_branch_summaries_graphql(
     };
     let body = build_batch_body(std::slice::from_ref(&remote))?;
     let command = run_graphql(&remote.hostname, &body)?;
-    if !command.success {
+    let material_errors: Vec<_> = command
+        .response
+        .errors
+        .iter()
+        .filter(|error| !is_closing_issues_error(error))
+        .collect();
+    if !command.success && material_errors.is_empty() && command.response.data.is_none() {
         return Err(anyhow!("gh api graphql failed"));
     }
-    if !command.response.errors.is_empty() {
-        let messages: Vec<&str> = command
-            .response
-            .errors
+    if !material_errors.is_empty() {
+        let messages: Vec<&str> = material_errors
             .iter()
             .map(|error| error.message.as_str())
             .collect();
@@ -1188,16 +1272,10 @@ fn list_prs_for_branches_rest(
         let args = [
             "pr", "list", "--head", branch, "--state", "all", "--limit", "1",
         ];
-        let output = match run_pr_list(Some(repo_root), &args, PR_LIST_FIELDS_WITH_CHECKS) {
-            Ok(output) if output.status.success() => output,
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                debug!(branch = branch, stderr = %stderr, "github:branch pr list with checks failed, retrying without checks");
-                match run_pr_list(Some(repo_root), &args, PR_LIST_FIELDS) {
-                    Ok(output) => output,
-                    Err(_) => continue,
-                }
-            }
+        let output = match run_pr_list_with_fallback(&DASHBOARD_PR_LIST_FIELD_SETS, |fields| {
+            run_pr_list(Some(repo_root), &args, fields)
+        }) {
+            Ok(output) => output,
             Err(_) => continue,
         };
 
@@ -1222,6 +1300,7 @@ fn list_prs_for_branches_rest(
                     checks,
                     check_meta,
                     url: Some(pr.url),
+                    closing_issues: pr.closing_issues.into_iter().map(Into::into).collect(),
                 },
             );
         }
@@ -1625,6 +1704,127 @@ mod tests {
     }
 
     #[test]
+    fn closing_issues_match_between_graphql_and_cli_shapes() {
+        let issue = serde_json::json!({
+            "number": 308,
+            "repository": { "name": "workmux", "owner": { "login": "raine" } }
+        });
+        let summary = parse_branch_summary_values(
+            serde_json::json!({
+                "nodes": [{
+                    "number": 42,
+                    "title": "Feature",
+                    "state": "OPEN",
+                    "isDraft": false,
+                    "url": "https://github.com/raine/workmux/pull/42",
+                    "closingIssuesReferences": { "nodes": [issue.clone()] },
+                    "commits": { "nodes": [] }
+                }]
+            }),
+            serde_json::Value::Null,
+        )
+        .unwrap();
+        let cli: Vec<PrBatchItem> = serde_json::from_value(serde_json::json!([{
+            "number": 42,
+            "title": "Feature",
+            "state": "OPEN",
+            "isDraft": false,
+            "headRefName": "feature",
+            "url": "https://github.com/raine/workmux/pull/42",
+            "closingIssuesReferences": [issue]
+        }]))
+        .unwrap();
+        let cli_issues: Vec<ClosingIssue> = cli
+            .into_iter()
+            .next()
+            .unwrap()
+            .closing_issues
+            .into_iter()
+            .map(Into::into)
+            .collect();
+
+        assert_eq!(summary.pr.unwrap().closing_issues, cli_issues);
+        assert_eq!(cli_issues[0].repository, "raine/workmux");
+    }
+
+    #[test]
+    fn old_pr_cache_entry_defaults_closing_issues() {
+        let pr: PrSummary = serde_json::from_value(serde_json::json!({
+            "number": 42,
+            "title": "Feature",
+            "state": "OPEN",
+            "isDraft": false,
+            "checks": null,
+            "url": "https://github.com/raine/workmux/pull/42"
+        }))
+        .unwrap();
+
+        assert!(pr.closing_issues.is_empty());
+    }
+
+    #[test]
+    fn pr_list_field_fallback_preserves_supported_fields() {
+        let mut attempts = Vec::new();
+        let output = run_pr_list_with_fallback(&DASHBOARD_PR_LIST_FIELD_SETS, |fields| {
+            attempts.push(fields.to_string());
+            let command = if fields.contains("closingIssuesReferences") {
+                "exit 1"
+            } else {
+                "printf '[]'"
+            };
+            std::process::Command::new("sh")
+                .args(["-c", command])
+                .output()
+        })
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts[1].contains("statusCheckRollup"));
+    }
+
+    #[test]
+    fn closing_issue_field_error_keeps_branch_summary() {
+        let remote = remote_query("repo", vec!["feature".to_string()]);
+        let data = HashMap::from([(
+            "repo_0".to_string(),
+            serde_json::json!({
+                "pr_r0_b0": { "nodes": [{
+                    "number": 42,
+                    "title": "Feature",
+                    "state": "OPEN",
+                    "isDraft": false,
+                    "url": "https://github.com/raine/workmux/pull/42",
+                    "closingIssuesReferences": null,
+                    "commits": { "nodes": [] }
+                }] },
+                "ref_r0_b0": null
+            }),
+        )]);
+        let errors = vec![GraphqlError {
+            message: "issues unavailable".to_string(),
+            path: vec![
+                "repo_0".into(),
+                "pr_r0_b0".into(),
+                "nodes".into(),
+                0.into(),
+                "closingIssuesReferences".into(),
+            ],
+        }];
+
+        let outcome = parse_remote_query(&data, &errors, 0, &remote).unwrap();
+        assert_eq!(outcome["feature"].pr.as_ref().unwrap().number, 42);
+        assert!(
+            outcome["feature"]
+                .pr
+                .as_ref()
+                .unwrap()
+                .closing_issues
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn pr_checks_take_precedence_over_branch_checks() {
         let repository = serde_json::from_value(serde_json::json!({
             "pr_br0_feature": {
@@ -1753,6 +1953,7 @@ mod tests {
         let query = body["query"].as_str().unwrap();
 
         assert!(!query.contains(&branch));
+        assert!(query.contains("closingIssuesReferences"));
         assert_eq!(body["variables"]["head_0_0"], branch);
         assert_eq!(
             body["variables"]["qualified_0_0"],

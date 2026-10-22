@@ -278,6 +278,33 @@ pub fn format_git_status(
     }
 }
 
+/// Format the issues GitHub reports as closed by a pull request.
+pub fn format_pr_issues(pr: Option<&PrSummary>) -> String {
+    let Some(pr) = pr else {
+        return String::new();
+    };
+    let pr_repository = pr.url.as_deref().and_then(|url| {
+        let path = url.split_once("://")?.1.split_once('/')?.1;
+        let mut segments = path.split('/');
+        Some(format!("{}/{}", segments.next()?, segments.next()?))
+    });
+
+    pr.closing_issues
+        .iter()
+        .map(|issue| {
+            if pr_repository
+                .as_deref()
+                .is_none_or(|repository| repository.eq_ignore_ascii_case(&issue.repository))
+            {
+                format!("#{}", issue.number)
+            } else {
+                format!("{}#{}", issue.repository, issue.number)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Format GitHub PR and check status as styled spans for dashboard display
 pub fn format_pr_status(
     pr: Option<&PrSummary>,
@@ -472,6 +499,33 @@ pub fn make_row_style(is_current: bool, is_main: bool, palette: &ThemePalette) -
 mod tests {
     use super::*;
     use crate::config::{ThemeMode, ThemeScheme};
+    use crate::github::ClosingIssue;
+
+    #[test]
+    fn pr_issues_qualify_only_external_repositories() {
+        let pr = PrSummary {
+            number: 42,
+            title: "Feature".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            checks: None,
+            check_meta: None,
+            url: Some("https://github.com/raine/workmux/pull/42".into()),
+            closing_issues: vec![
+                ClosingIssue {
+                    number: 308,
+                    repository: "Raine/Workmux".into(),
+                },
+                ClosingIssue {
+                    number: 12,
+                    repository: "acme/tracker".into(),
+                },
+            ],
+        };
+
+        assert_eq!(format_pr_issues(Some(&pr)), "#308 acme/tracker#12");
+        assert_eq!(format_pr_issues(None), "");
+    }
 
     #[test]
     fn elapsed_time_dims_inactive_clock_units() {
